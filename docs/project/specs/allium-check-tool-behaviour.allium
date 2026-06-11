@@ -251,3 +251,54 @@ rule UnresolvedUsePathWarnsInMultiFileMode {
     ensures: FindingObserved(code: "allium.use.unresolvedPath", severity: warning)
     ensures: FindingMessage includes path
 }
+
+rule QualifiedTriggerCallIsValidTriggerForm {
+    when: CheckCommandInvokedWithInputs(inputs)
+    requires: rule when clause is qualified trigger call (e.g. alias/Trigger(params))
+
+    ensures: FindingNotObserved(code: "allium.rule.invalidTrigger")
+}
+
+rule CrossModuleTriggerEmissionSatisfiesSubscription {
+    when: CheckCommandInvokedWithInputs(inputs)
+    requires: inputs resolve to multiple files
+    requires: file_a provides or emits trigger
+    requires: file_b listens for trigger, qualified via use alias mapping to file_a or unqualified
+    requires: file_b has use declaration mapping alias to file_a
+
+    ensures: FindingNotObserved(code: "allium.rule.unreachableTrigger", trigger: trigger)
+}
+
+rule QualifiedTriggerUnreachableWhenAliasedModuleLacksIt {
+    when: CheckCommandInvokedWithInputs(inputs)
+    requires: inputs resolve to multiple files
+    requires: file_b listens for trigger qualified via use alias mapping to file_a
+    requires: file_a neither provides nor emits trigger
+
+    ensures: FindingObserved(code: "allium.rule.unreachableTrigger", severity: info)
+    ensures: FindingMessage names the imported module alias
+}
+
+rule QualifiedTriggerOutsideCheckSetNotFlagged {
+    when: CheckCommandInvokedWithInputs(inputs)
+    requires: file listens for trigger qualified via use alias
+    requires: alias target does not resolve to a file in the check set
+
+    ensures: FindingNotObserved(code: "allium.rule.unreachableTrigger", trigger: trigger)
+}
+
+rule DeferredWithoutLocationHintWarns {
+    when: CheckCommandInvokedWithInputs(inputs)
+    requires: file contains deferred declaration
+    requires: deferred line excludes quoted path, URL, and "-- see:" comment
+
+    ensures: FindingObserved(code: "allium.deferred.missingLocationHint", severity: warning)
+}
+
+rule DeferredWithLocationHintSuppressesWarning {
+    when: CheckCommandInvokedWithInputs(inputs)
+    requires: file contains deferred_declaration
+    requires: deferred_declaration line includes quoted path, URL, or "-- see:" comment
+
+    ensures: FindingNotObserved(code: "allium.deferred.missingLocationHint", declaration: deferred_declaration)
+}

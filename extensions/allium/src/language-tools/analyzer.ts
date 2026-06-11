@@ -1,4 +1,9 @@
-import { findMatchingBrace, parseAlliumBlocks } from "./parser";
+import {
+  findMatchingBrace,
+  parseAlliumBlocks,
+  parseAlliumDocument,
+} from "./parser";
+import type { WasmDiagnostic } from "./wasm-ast";
 
 export type FindingSeverity = "error" | "warning" | "info";
 export type DiagnosticsMode = "strict" | "relaxed";
@@ -21,7 +26,26 @@ export function analyzeAllium(
 ): Finding[] {
   const findings: Finding[] = [];
   const lineStarts = buildLineStarts(text);
-  const blocks = parseAlliumBlocks(text);
+  const { blocks: astBlocks, diagnostics: parseDiagnostics } =
+    parseAlliumDocument(text);
+
+  findings.push(...parseDiagnosticsToFindings(parseDiagnostics, lineStarts));
+
+  // Comment- and string-aware view of the source. The regex lanes below run
+  // over raw text with no lexer context, so without this they match
+  // keyword-shaped text inside comments or string literals that the Rust front
+  // end never reads as code (issue #28). Masking blanks comment/string content
+  // to spaces while preserving length, byte offsets, and line breaks, so every
+  // finding offset still maps back to the original source. Block bodies are
+  // re-sliced from the masked text for the same reason. Raw `text` is kept only
+  // for the two consumers that deliberately read comment/string content:
+  // `findDeferredLocationHints` (the `-- see:` / quoted-path hint) and
+  // `applySuppressions` (the `-- allium-ignore` directive).
+  const maskedText = maskCommentsAndStrings(text);
+  const blocks = astBlocks.map((block) => ({
+    ...block,
+    body: maskedText.slice(block.bodyStartOffset, block.endOffset),
+  }));
 
   const ruleBlocks = blocks.filter((block) => block.kind === "rule");
   for (const block of ruleBlocks) {
@@ -97,49 +121,65 @@ export function analyzeAllium(
   }
   findings.push(...findInvalidTriggerIssues(lineStarts, blocks));
 
-  findings.push(...findDuplicateConfigKeys(text, lineStarts, blocks));
-  findings.push(...findDuplicateDefaultNames(text, lineStarts));
-  findings.push(...findDefaultTypeReferenceIssues(text, lineStarts, blocks));
+  findings.push(...findDuplicateConfigKeys(maskedText, lineStarts, blocks));
+  findings.push(...findDuplicateDefaultNames(maskedText, lineStarts));
+  findings.push(
+    ...findDefaultTypeReferenceIssues(maskedText, lineStarts, blocks),
+  );
   findings.push(...findConfigParameterShapeIssues(lineStarts, blocks));
-  findings.push(...findUndefinedConfigReferences(text, lineStarts, blocks));
   findings.push(
-    ...findUndefinedExternalConfigReferences(text, lineStarts, blocks),
+    ...findUndefinedConfigReferences(maskedText, lineStarts, blocks),
   );
-  findings.push(...findUndefinedStatusAssignments(text, lineStarts, blocks));
-  findings.push(...findStatusStateMachineIssues(text, lineStarts, blocks));
+  findings.push(
+    ...findUndefinedExternalConfigReferences(maskedText, lineStarts, blocks),
+  );
+  findings.push(
+    ...findUndefinedStatusAssignments(maskedText, lineStarts, blocks),
+  );
+  findings.push(...findStatusStateMachineIssues(maskedText, lineStarts, blocks));
   findings.push(...findEnumDeclarationIssues(lineStarts, blocks));
-  findings.push(...findSumTypeIssues(text, lineStarts));
+  findings.push(...findSumTypeIssues(maskedText, lineStarts));
   findings.push(
-    ...findUnguardedVariantFieldAccessIssues(text, lineStarts, blocks),
+    ...findUnguardedVariantFieldAccessIssues(maskedText, lineStarts, blocks),
   );
-  findings.push(...findTypeReferenceIssues(text, lineStarts, blocks));
-  findings.push(...findRelationshipReferenceIssues(text, lineStarts, blocks));
-  findings.push(...findRuleTypeReferenceIssues(lineStarts, blocks, text));
-  findings.push(...findRuleUndefinedBindingIssues(lineStarts, blocks, text));
-  findings.push(...findContextBindingIssues(text, lineStarts, blocks));
-  findings.push(...findOpenQuestions(text, lineStarts));
-  findings.push(...findSurfaceActorLinkIssues(text, lineStarts, blocks));
+  findings.push(...findTypeReferenceIssues(maskedText, lineStarts, blocks));
+  findings.push(
+    ...findRelationshipReferenceIssues(maskedText, lineStarts, blocks),
+  );
+  findings.push(...findRuleTypeReferenceIssues(lineStarts, blocks, maskedText));
+  findings.push(
+    ...findRuleUndefinedBindingIssues(lineStarts, blocks, maskedText),
+  );
+  findings.push(...findContextBindingIssues(maskedText, lineStarts, blocks));
+  findings.push(...findOpenQuestions(maskedText, lineStarts));
+  findings.push(...findSurfaceActorLinkIssues(maskedText, lineStarts, blocks));
   findings.push(...findSurfaceRelatedIssues(lineStarts, blocks));
   findings.push(...findSurfaceBindingUsageIssues(lineStarts, blocks));
-  findings.push(...findSurfacePathAndIterationIssues(text, lineStarts, blocks));
-  findings.push(...findSurfaceRuleCoverageIssues(text, lineStarts, blocks));
-  findings.push(...findSurfaceImpossibleWhenIssues(lineStarts, blocks));
+  findings.push(
+    ...findSurfacePathAndIterationIssues(maskedText, lineStarts, blocks),
+  );
+  findings.push(
+    ...findSurfaceRuleCoverageIssues(maskedText, lineStarts, blocks),
+  );
+  findings.push(...findSurfaceImpossibleWhenIssues(lineStarts, blocks, text));
   findings.push(...findSurfaceNamedBlockUniquenessIssues(lineStarts, blocks));
   findings.push(
-    ...findSurfaceRequiresDeferredHintIssues(lineStarts, blocks, text),
+    ...findSurfaceRequiresDeferredHintIssues(lineStarts, blocks, maskedText),
   );
-  findings.push(...findSurfaceProvidesTriggerIssues(lineStarts, blocks, text));
-  findings.push(...findUnusedEntityIssues(text, lineStarts));
-  findings.push(...findUnusedNamedDefinitionIssues(text, lineStarts));
-  findings.push(...findUnusedFieldIssues(text, lineStarts));
+  findings.push(
+    ...findSurfaceProvidesTriggerIssues(lineStarts, blocks, maskedText),
+  );
+  findings.push(...findUnusedEntityIssues(maskedText, lineStarts));
+  findings.push(...findUnusedNamedDefinitionIssues(maskedText, lineStarts));
+  findings.push(...findUnusedFieldIssues(maskedText, lineStarts));
   findings.push(...findUnreachableRuleTriggerIssues(lineStarts, blocks));
-  findings.push(...findExternalEntitySourceHints(text, lineStarts, blocks));
-  findings.push(...findDeferredLocationHints(text, lineStarts));
-  findings.push(...findImplicitLambdaIssues(text, lineStarts));
-  findings.push(...findNeverFireRuleIssues(lineStarts, blocks));
+  findings.push(...findExternalEntitySourceHints(maskedText, lineStarts, blocks));
+  findings.push(...findDeferredLocationHints(text, maskedText, lineStarts));
+  findings.push(...findImplicitLambdaIssues(maskedText, lineStarts));
+  findings.push(...findNeverFireRuleIssues(lineStarts, blocks, text));
   findings.push(...findDuplicateRuleBehaviourIssues(lineStarts, blocks));
   findings.push(...findExpressionTypeMismatchIssues(lineStarts, blocks));
-  findings.push(...findDerivedCircularDependencyIssues(text, lineStarts));
+  findings.push(...findDerivedCircularDependencyIssues(maskedText, lineStarts));
 
   return applySuppressions(
     applyDiagnosticsMode(findings, options.mode ?? "strict"),
@@ -357,6 +397,7 @@ function findStatusStateMachineIssues(
   }
 
   const contextTypes = collectContextBindingTypes(blocks);
+  const commandParamTypes = collectCommandParamTypes(blocks, statusByEntity);
   const assignedByEntity = new Map<string, Set<string>>();
   const transitionsByEntity = new Map<string, Map<string, Set<string>>>();
   const assignmentLocations = new Map<string, number>();
@@ -370,6 +411,7 @@ function findStatusStateMachineIssues(
   const ruleBlocks = blocks.filter((block) => block.kind === "rule");
   for (const rule of ruleBlocks) {
     const bindingTypes = collectRuleBindingTypes(rule.body, contextTypes);
+    augmentBindingTypesFromCommands(rule.body, commandParamTypes, bindingTypes);
     const clauseLines = collectRuleClauseLines(rule.body);
     const requiresByBinding = new Map<string, Set<string>>();
     for (const line of clauseLines) {
@@ -402,6 +444,28 @@ function findStatusStateMachineIssues(
         const set = requiresByBinding.get(rootBinding) ?? new Set<string>();
         set.add(status);
         requiresByBinding.set(rootBinding, set);
+      }
+      // Negated: binding.status != value — every other status value of the
+      // entity gains an exit edge through this rule.
+      const negatedMatch = line.text.match(
+        /([a-z_][a-z0-9_]*)\.status\s*!=\s*([a-z_][a-z0-9_]*)\b/,
+      );
+      if (negatedMatch) {
+        const binding = negatedMatch[1];
+        const status = negatedMatch[2];
+        const resolved = resolveBindingEntity(
+          binding, status, bindingTypes, statusByEntity,
+        );
+        const values = resolved ? statusByEntity.get(resolved) : undefined;
+        if (values?.has(status)) {
+          const set = requiresByBinding.get(binding) ?? new Set<string>();
+          for (const value of values) {
+            if (value !== status) {
+              set.add(value);
+            }
+          }
+          requiresByBinding.set(binding, set);
+        }
       }
     }
 
@@ -2373,9 +2437,14 @@ function collectRuleBoundNames(
     /^\s*when\s*:\s*[A-Za-z_][A-Za-z0-9_]*(?:\/[A-Za-z_][A-Za-z0-9_]*)?\s*\(([^)]*)\)/m;
   const whenCallMatch = ruleBody.match(whenCallPattern);
   if (whenCallMatch) {
-    for (const raw of whenCallMatch[1].split(",")) {
+    for (const raw of splitTopLevelArgs(whenCallMatch[1])) {
       const name = raw.trim();
       if (name.length === 0 || name === "_") {
+        continue;
+      }
+      const typed = name.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)$/);
+      if (typed && isTypeAnnotationText(typed[2])) {
+        bound.add(typed[1]);
         continue;
       }
       if (/^[A-Za-z_][A-Za-z0-9_]*\??$/.test(name)) {
@@ -2423,6 +2492,128 @@ function collectRuleBoundNames(
   return bound;
 }
 
+function splitTopLevelArgs(argsText: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let angleDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let stringQuote: string | undefined;
+  let escaped = false;
+
+  for (let i = 0; i < argsText.length; i += 1) {
+    const ch = argsText[i];
+
+    if (stringQuote) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === stringQuote) {
+        stringQuote = undefined;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      stringQuote = ch;
+      continue;
+    }
+
+    if (ch === "<") {
+      angleDepth += 1;
+    } else if (ch === ">" && angleDepth > 0) {
+      angleDepth -= 1;
+    } else if (ch === "(") {
+      parenDepth += 1;
+    } else if (ch === ")" && parenDepth > 0) {
+      parenDepth -= 1;
+    } else if (ch === "[") {
+      bracketDepth += 1;
+    } else if (ch === "]" && bracketDepth > 0) {
+      bracketDepth -= 1;
+    } else if (ch === "{") {
+      braceDepth += 1;
+    } else if (ch === "}" && braceDepth > 0) {
+      braceDepth -= 1;
+    } else if (
+      ch === "," &&
+      angleDepth === 0 &&
+      parenDepth === 0 &&
+      bracketDepth === 0 &&
+      braceDepth === 0
+    ) {
+      parts.push(argsText.slice(start, i));
+      start = i + 1;
+    }
+  }
+
+  parts.push(argsText.slice(start));
+  return parts;
+}
+
+function isTypeAnnotationText(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  if (trimmed.endsWith("?")) {
+    return isTypeAnnotationText(trimmed.slice(0, -1));
+  }
+
+  const generic = parseGenericTypeText(trimmed);
+  if (generic) {
+    const args = splitTopLevelArgs(generic.args).map((arg) => arg.trim());
+    return (
+      isTypeAnnotationText(generic.name) &&
+      args.length > 0 &&
+      args.every((arg) => arg.length > 0 && isTypeAnnotationText(arg))
+    );
+  }
+
+  return /^(?:[A-Za-z_][A-Za-z0-9_]*\/)?[A-Z][A-Za-z0-9_]*$/.test(trimmed);
+}
+
+function parseGenericTypeText(
+  text: string,
+): { name: string; args: string } | undefined {
+  let depth = 0;
+  let genericStart = -1;
+  let genericEnd = -1;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "<") {
+      if (depth === 0 && genericStart === -1) {
+        genericStart = i;
+      }
+      depth += 1;
+    } else if (ch === ">") {
+      depth -= 1;
+      if (depth < 0) {
+        return undefined;
+      }
+      if (depth === 0) {
+        genericEnd = i;
+      }
+    }
+  }
+
+  if (
+    depth !== 0 ||
+    genericStart === -1 ||
+    genericEnd !== text.length - 1
+  ) {
+    return undefined;
+  }
+
+  return {
+    name: text.slice(0, genericStart).trim(),
+    args: text.slice(genericStart + 1, genericEnd).trim(),
+  };
+}
+
 function isInsideDoubleQuotedStringAtIndex(
   text: string,
   index: number,
@@ -2457,6 +2648,94 @@ function buildLineStarts(text: string): number[] {
     }
   }
   return starts;
+}
+
+/**
+ * Return a copy of `text` with the *content* of `--` comments, `"…"` strings,
+ * and `` `…` `` backtick literals replaced by spaces. Length, byte offsets, and
+ * line breaks (`\n`) are preserved, so a finding located in the masked text
+ * maps back to the same position in the original source.
+ *
+ * This mirrors the Rust lexer (`crates/allium-parser/src/lexer.rs`) so the
+ * regex lanes stop matching keyword-shaped text the front end reads as
+ * comment/string content (issue #28):
+ *   - line comments run from `--` to the next `\n` (a lone `\r` does NOT end
+ *     them — matching the lexer, which only breaks on `\n`);
+ *   - strings honour `\` escapes and are terminated by `"` or `\n`;
+ *   - backtick literals are terminated by `` ` ``, `\n`, or `\r`.
+ *
+ * Opening/closing delimiters (`"`, `` ` ``) and the `--` of a comment are kept,
+ * so lanes that only need to detect that a string/comment is present (e.g. the
+ * type-mismatch operand lanes) still see one.
+ */
+/**
+ * Re-read a regex-captured operand from the raw source when it is a string
+ * literal. The comparison lanes match on masked text, where string content is
+ * blanked to spaces — distinct same-length literals look identical there
+ * (`"a"` and `"b"` both become `" "`), which broke value-equality reasoning
+ * (spurious `rule.neverFires`, missed `surface.impossibleWhen`). The mask
+ * preserves length and offsets, so the literal's true text lives at the same
+ * offsets in the raw source.
+ */
+function rawStringOperand(
+  rawText: string,
+  absoluteStart: number,
+  operand: string,
+): string {
+  if (!operand.startsWith('"')) {
+    return operand;
+  }
+  return rawText.slice(absoluteStart, absoluteStart + operand.length);
+}
+
+export function maskCommentsAndStrings(text: string): string {
+  const out = text.split("");
+  const n = text.length;
+  const blank = (i: number): void => {
+    if (text[i] !== "\n") {
+      out[i] = " ";
+    }
+  };
+  let i = 0;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === "-" && text[i + 1] === "-") {
+      i += 2; // keep the `--`
+      while (i < n && text[i] !== "\n") {
+        blank(i);
+        i += 1;
+      }
+    } else if (ch === '"') {
+      i += 1; // keep the opening quote
+      while (i < n && text[i] !== '"' && text[i] !== "\n") {
+        if (text[i] === "\\") {
+          blank(i);
+          if (i + 1 < n) {
+            blank(i + 1);
+            i += 2;
+            continue;
+          }
+        }
+        blank(i);
+        i += 1;
+      }
+      if (i < n && text[i] === '"') {
+        i += 1; // keep the closing quote
+      }
+    } else if (ch === "`") {
+      i += 1; // keep the opening backtick
+      while (i < n && text[i] !== "`" && text[i] !== "\n" && text[i] !== "\r") {
+        blank(i);
+        i += 1;
+      }
+      if (i < n && text[i] === "`") {
+        i += 1; // keep the closing backtick
+      }
+    } else {
+      i += 1;
+    }
+  }
+  return out.join("");
 }
 
 function offsetToPosition(
@@ -2495,6 +2774,32 @@ function rangeFinding(
     start: offsetToPosition(lineStarts, startOffset),
     end: offsetToPosition(lineStarts, endOffset),
   };
+}
+
+/**
+ * Map Rust front-end parse diagnostics into analyzer findings. Previously the
+ * WASM parse result's `diagnostics` were discarded, so malformed input
+ * produced zero parse errors in the extension, LSP, and `check.js` while
+ * `allium check` reported them. Surfacing them here closes that gap (issue #25).
+ *
+ * Parse diagnostics carry no code in the Rust output, so we synthesise one per
+ * severity to keep suppression, baselines, and SARIF rule descriptors working.
+ */
+function parseDiagnosticsToFindings(
+  diagnostics: WasmDiagnostic[],
+  lineStarts: number[],
+): Finding[] {
+  return diagnostics.map((diagnostic) => {
+    const isError = diagnostic.severity === "Error";
+    return rangeFinding(
+      lineStarts,
+      diagnostic.span.start,
+      diagnostic.span.end,
+      isError ? "allium.parse.error" : "allium.parse.warning",
+      diagnostic.message,
+      isError ? "error" : "warning",
+    );
+  });
 }
 
 function findSurfaceActorLinkIssues(
@@ -2790,6 +3095,7 @@ function findSurfaceRuleCoverageIssues(
 function findSurfaceImpossibleWhenIssues(
   lineStarts: number[],
   blocks: ReturnType<typeof parseAlliumBlocks>,
+  rawText: string,
 ): Finding[] {
   const findings: Finding[] = [];
   const surfaces = blocks.filter((block) => block.kind === "surface");
@@ -2810,6 +3116,15 @@ function findSurfaceImpossibleWhenIssues(
       }
 
       const condition = whenMatch[1];
+      // The condition group is anchored at the end of the when-match; track
+      // its offset in the (masked) body so string operands can be re-read from
+      // the raw source at the same offsets (the mask is length-preserving).
+      const conditionStart =
+        surface.bodyStartOffset +
+        cursor +
+        (whenMatch.index ?? 0) +
+        whenMatch[0].length -
+        condition.length;
       const equalsByExpr = new Map<string, Set<string>>();
       comparisonPattern.lastIndex = 0;
       for (
@@ -2818,7 +3133,9 @@ function findSurfaceImpossibleWhenIssues(
         cmp = comparisonPattern.exec(condition)
       ) {
         const expr = cmp[1];
-        const value = cmp[2];
+        const valueStart =
+          conditionStart + cmp.index + cmp[0].length - cmp[2].length;
+        const value = rawStringOperand(rawText, valueStart, cmp[2]);
         const set = equalsByExpr.get(expr) ?? new Set<string>();
         set.add(value);
         equalsByExpr.set(expr, set);
@@ -2882,13 +3199,20 @@ function findSurfaceRequiresDeferredHintIssues(
 ): Finding[] {
   const findings: Finding[] = [];
   const deferredNames = new Set<string>();
-  const deferredPattern = /^\s*deferred\s+([A-Za-z_][A-Za-z0-9_.]*)\b/gm;
+  const deferredPattern = /^\s*deferred\s+([A-Za-z_][A-Za-z0-9_./]*)\b/gm;
   for (
     let deferred = deferredPattern.exec(text);
     deferred;
     deferred = deferredPattern.exec(text)
   ) {
-    deferredNames.add(deferred[1]);
+    const name = deferred[1];
+    deferredNames.add(name);
+    // A module-qualified name (`billing/InvoiceWorkflow`) hints the unqualified
+    // workflow too: surface requires clauses always use the bare name (#26).
+    const qualifierEnd = name.lastIndexOf("/");
+    if (qualifierEnd >= 0) {
+      deferredNames.add(name.slice(qualifierEnd + 1));
+    }
   }
 
   const surfaces = blocks.filter((block) => block.kind === "surface");
@@ -3015,6 +3339,90 @@ function parseProvidesTriggerCalls(
     }
   }
   return calls;
+}
+
+/**
+ * Command name → positional parameter entity types, from surface `provides:`
+ * declarations like `Cancel(admin, sub: Subscription)`. Rule `when:` parameters
+ * are positional-only, so this is the only place their entity type is declared.
+ */
+function collectCommandParamTypes(
+  blocks: ReturnType<typeof parseAlliumBlocks>,
+  statusByEntity: Map<string, Set<string>>,
+): Map<string, Array<string | undefined>> {
+  const result = new Map<string, Array<string | undefined>>();
+  const callPattern = /([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/;
+  for (const surface of blocks.filter((block) => block.kind === "surface")) {
+    const sectionPattern = /^(\s*)provides\s*:\s*$/gm;
+    for (
+      let section = sectionPattern.exec(surface.body);
+      section;
+      section = sectionPattern.exec(surface.body)
+    ) {
+      const baseIndent = (section[1] ?? "").length;
+      let cursor = section.index + section[0].length + 1;
+      while (cursor < surface.body.length) {
+        const lineEnd = surface.body.indexOf("\n", cursor);
+        const end = lineEnd >= 0 ? lineEnd : surface.body.length;
+        const line = surface.body.slice(cursor, end);
+        const trimmed = line.trim();
+        const indent = (line.match(/^\s*/) ?? [""])[0].length;
+        if (trimmed.length === 0) {
+          cursor = end + 1;
+          continue;
+        }
+        if (indent <= baseIndent) {
+          break;
+        }
+        const call = line.match(callPattern);
+        if (call) {
+          const params = call[2].split(",").map((arg) => {
+            const typed = arg
+              .trim()
+              .match(/^[a-z_][a-z0-9_]*\s*:\s*([A-Z][A-Za-z0-9_]*)$/);
+            return typed && statusByEntity.has(typed[1]) ? typed[1] : undefined;
+          });
+          if (params.some((param) => param !== undefined)) {
+            result.set(call[1], params);
+          }
+        }
+        cursor = end + 1;
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Augment a rule's binding types with the surface-declared parameter types of
+ * the command it subscribes to, matched positionally against the rule's
+ * `when:` arguments. Explicit binding types already collected win.
+ */
+function augmentBindingTypesFromCommands(
+  ruleBody: string,
+  commandParamTypes: Map<string, Array<string | undefined>>,
+  bindingTypes: Map<string, string>,
+): void {
+  const whenCall = ruleBody.match(
+    /^\s*when\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/m,
+  );
+  if (!whenCall) {
+    return;
+  }
+  const params = commandParamTypes.get(whenCall[1]);
+  if (!params) {
+    return;
+  }
+  const args = whenCall[2].split(",").map((arg) => arg.trim());
+  for (let i = 0; i < args.length && i < params.length; i++) {
+    const entity = params[i];
+    if (!entity || !/^[a-z_][a-z0-9_]*$/.test(args[i])) {
+      continue;
+    }
+    if (!bindingTypes.has(args[i])) {
+      bindingTypes.set(args[i], entity);
+    }
+  }
 }
 
 function findUnusedEntityIssues(text: string, lineStarts: number[]): Finding[] {
@@ -3196,6 +3604,13 @@ function findUnreachableRuleTriggerIssues(
   const produced = new Set<string>();
   const rules = blocks.filter((block) => block.kind === "rule");
   const ensureCallPattern = /^\s*ensures\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm;
+  // A trigger emitted on an `if`/`else if`/`else` branch or inside a `for`
+  // iteration of an ensures value is an emission too (issue #19): capture the
+  // leading call after each branch header's colon. Scoped to ensures clause
+  // extents so branch calls in other clauses don't register, mirroring the
+  // Rust analyzer which walks ensures values only.
+  const branchCallPattern =
+    /^[^\S\n]*(?:if|else(?:[^\S\n]+if)?|for)\b[^\n]*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/gm;
   for (const rule of rules) {
     for (
       let match = ensureCallPattern.exec(rule.body);
@@ -3203,6 +3618,15 @@ function findUnreachableRuleTriggerIssues(
       match = ensureCallPattern.exec(rule.body)
     ) {
       produced.add(match[1]);
+    }
+    for (const region of ensuresClauseRegions(rule.body)) {
+      for (
+        let match = branchCallPattern.exec(region);
+        match;
+        match = branchCallPattern.exec(region)
+      ) {
+        produced.add(match[1]);
+      }
     }
   }
 
@@ -3226,6 +3650,12 @@ function findUnreachableRuleTriggerIssues(
       call = callPattern.exec(triggerLine)
     ) {
       const callName = call[1];
+      // `alias/Trigger(...)` subscribes to a trigger emitted by an imported
+      // spec. Single-file analysis cannot see the emitting module, so
+      // qualified references are never flagged (issue #19).
+      if (call.index > 0 && triggerLine[call.index - 1] === "/") {
+        continue;
+      }
       if (provided.has(callName) || produced.has(callName)) {
         continue;
       }
@@ -3247,6 +3677,37 @@ function findUnreachableRuleTriggerIssues(
   }
 
   return findings;
+}
+
+/**
+ * Extract the text of each `ensures:` clause value in a rule body: the tail
+ * of the `ensures:` line plus every following line indented deeper than the
+ * `ensures` keyword. Used to scope branch-emission scanning to ensures
+ * clauses only, mirroring the Rust analyzer which walks ensures values.
+ */
+function ensuresClauseRegions(body: string): string[] {
+  const regions: string[] = [];
+  const lines = body.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^([^\S\n]*)ensures[^\S\n]*:(.*)$/);
+    if (!match) {
+      continue;
+    }
+    const indent = match[1].length;
+    const parts = [match[2]];
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j];
+      if (line.trim().length > 0) {
+        const lineIndent = line.length - line.trimStart().length;
+        if (lineIndent <= indent) {
+          break;
+        }
+      }
+      parts.push(line);
+    }
+    regions.push(parts.join("\n"));
+  }
+  return regions;
 }
 
 function findExternalEntitySourceHints(
@@ -3284,21 +3745,38 @@ function findExternalEntitySourceHints(
 
 function findDeferredLocationHints(
   text: string,
+  maskedText: string,
   lineStarts: number[],
 ): Finding[] {
   const findings: Finding[] = [];
-  const pattern = /^\s*deferred\s+([A-Za-z_][A-Za-z0-9_.]*)(.*)$/gm;
-  for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
-    const suffix = (match[2] ?? "").trim();
+  // Detect the `deferred` keyword on the masked text so a `deferred`-shaped
+  // token inside a comment or string (which the Rust front end reads as
+  // content, not a declaration) does not produce a spurious warning (#28). The
+  // hint itself is then read from the *raw* text, since the `-- see:` / quoted
+  // path convention lives in comment/string content the mask blanks out.
+  const pattern = /^[^\S\n]*deferred\s+([A-Za-z_][A-Za-z0-9_.]*)/gm;
+  for (
+    let match = pattern.exec(maskedText);
+    match;
+    match = pattern.exec(maskedText)
+  ) {
+    const name = match[1];
+    const offset = match.index + match[0].indexOf(name);
+    const suffixStart = offset + name.length;
+    const lineEnd = text.indexOf("\n", suffixStart);
+    const suffix = text
+      .slice(suffixStart, lineEnd < 0 ? text.length : lineEnd)
+      .trim();
+    // A location hint points at where the detail lives: a quoted path, a URL, or
+    // the `-- see:` comment convention shown in the language reference.
     if (
       suffix.includes("http://") ||
       suffix.includes("https://") ||
-      suffix.includes('"')
+      suffix.includes('"') ||
+      suffix.includes("-- see:")
     ) {
       continue;
     }
-    const name = match[1];
-    const offset = match.index + match[0].indexOf(name);
     findings.push(
       rangeFinding(
         lineStarts,
@@ -3345,6 +3823,7 @@ function findImplicitLambdaIssues(
 function findNeverFireRuleIssues(
   lineStarts: number[],
   blocks: ReturnType<typeof parseAlliumBlocks>,
+  rawText: string,
 ): Finding[] {
   const findings: Finding[] = [];
   const rules = blocks.filter((block) => block.kind === "rule");
@@ -3364,7 +3843,16 @@ function findNeverFireRuleIssues(
       }
       const expr = match[1];
       const operator = match[2];
-      const value = match[3];
+      // The value group is anchored at the end of the match, so its offset in
+      // the (masked) body is the match end minus its length; the mask is
+      // length-preserving, so the same offsets index the raw source.
+      const valueStart =
+        rule.bodyStartOffset +
+        line.startOffset +
+        (match.index ?? 0) +
+        match[0].length -
+        match[3].length;
+      const value = rawStringOperand(rawText, valueStart, match[3]);
       if (operator === "=") {
         const set = equalsByExpr.get(expr) ?? new Set<string>();
         set.add(value);

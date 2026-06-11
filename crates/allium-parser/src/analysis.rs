@@ -29,7 +29,7 @@ pub fn analyze_with_external_refs(
     source: &str,
     external_refs: &HashSet<String>,
 ) -> Vec<Diagnostic> {
-    run_checks(Ctx::new(module, external_refs, None), source)
+    run_checks(Ctx::new(module, external_refs, None, None), source)
 }
 
 /// Run structural checks with full cross-module context.
@@ -37,13 +37,25 @@ pub fn analyze_with_external_refs(
 /// `external_refs` — declaration names referenced by other modules (suppresses
 /// unused warnings). `resolved_use_paths` — use path strings that resolved to
 /// files in the check set (enables unresolved-path warnings).
+/// `imported_triggers` — per `use` alias, the trigger names the aliased module
+/// provides or emits; aliases whose targets are outside the check set are
+/// absent (enables cross-spec trigger reachability).
 pub fn analyze_with_cross_module(
     module: &Module,
     source: &str,
     external_refs: &HashSet<String>,
     resolved_use_paths: &HashSet<String>,
+    imported_triggers: &HashMap<String, HashSet<String>>,
 ) -> Vec<Diagnostic> {
-    run_checks(Ctx::new(module, external_refs, Some(resolved_use_paths)), source)
+    run_checks(
+        Ctx::new(
+            module,
+            external_refs,
+            Some(resolved_use_paths),
+            Some(imported_triggers),
+        ),
+        source,
+    )
 }
 
 fn run_checks(mut ctx: Ctx<'_>, source: &str) -> Vec<Diagnostic> {
@@ -58,7 +70,7 @@ fn run_checks(mut ctx: Ctx<'_>, source: &str) -> Vec<Diagnostic> {
     ctx.check_unused_entities();
     ctx.check_unused_definitions();
     ctx.check_unresolved_use_paths();
-    ctx.check_deferred_location_hints();
+    ctx.check_deferred_location_hints(source);
     ctx.check_rule_invalid_triggers();
     ctx.check_rule_undefined_bindings();
     ctx.check_duplicate_let_bindings();
@@ -82,7 +94,7 @@ pub fn analyse_with_external_refs(
     external_refs: &HashSet<String>,
 ) -> crate::diagnostic::AnalyseResult {
     let diagnostics = analyze_with_external_refs(module, source, external_refs);
-    let findings = find_process_issues(module);
+    let findings = find_process_issues(module, None);
     crate::diagnostic::AnalyseResult {
         diagnostics,
         findings,
@@ -96,9 +108,16 @@ pub fn analyse_with_cross_module(
     source: &str,
     external_refs: &HashSet<String>,
     resolved_use_paths: &HashSet<String>,
+    imported_triggers: &HashMap<String, HashSet<String>>,
 ) -> crate::diagnostic::AnalyseResult {
-    let diagnostics = analyze_with_cross_module(module, source, external_refs, resolved_use_paths);
-    let findings = find_process_issues(module);
+    let diagnostics = analyze_with_cross_module(
+        module,
+        source,
+        external_refs,
+        resolved_use_paths,
+        imported_triggers,
+    );
+    let findings = find_process_issues(module, Some(imported_triggers));
     crate::diagnostic::AnalyseResult {
         diagnostics,
         findings,
@@ -182,9 +201,12 @@ impl<'a> EntityInfo<'a> {
 }
 
 /// Compute process-level findings: data flow, reachability, conflicts, invariants.
-fn find_process_issues(module: &Module) -> Vec<crate::diagnostic::Finding> {
+fn find_process_issues(
+    module: &Module,
+    imported_triggers: Option<&HashMap<String, HashSet<String>>>,
+) -> Vec<crate::diagnostic::Finding> {
     let empty = HashSet::new();
-    let mut ctx = Ctx::new(module, &empty, None);
+    let mut ctx = Ctx::new(module, &empty, None, imported_triggers);
     let info = EntityInfo::from_module(module);
     ctx.collect_process_findings(&info);
     ctx.collect_conflict_findings(&info);
@@ -254,6 +276,11 @@ struct Ctx<'a> {
     /// `Some(set)` = multi-file mode; `set` contains use path strings that
     /// resolved to files in the check set.
     resolved_use_paths: Option<&'a HashSet<String>>,
+    /// `None` = single-file mode (qualified trigger reachability unknowable).
+    /// `Some(map)` = multi-file mode; per `use` alias, the trigger names the
+    /// aliased module provides or emits. Aliases whose targets fall outside
+    /// the check set are absent from the map.
+    imported_triggers: Option<&'a HashMap<String, HashSet<String>>>,
     diagnostics: Vec<Diagnostic>,
     findings: Vec<crate::diagnostic::Finding>,
 }
@@ -263,11 +290,13 @@ impl<'a> Ctx<'a> {
         module: &'a Module,
         external_refs: &'a HashSet<String>,
         resolved_use_paths: Option<&'a HashSet<String>>,
+        imported_triggers: Option<&'a HashMap<String, HashSet<String>>>,
     ) -> Self {
         Self {
             module,
             external_refs,
             resolved_use_paths,
+            imported_triggers,
             diagnostics: Vec::new(),
             findings: Vec::new(),
         }
@@ -700,13 +729,30 @@ impl Ctx<'_> {
             return;
         }
 
+        // Command name → positional parameter entity types, from surface
+        // `provides:` declarations like `Cancel(admin, sub: Subscription)`.
+        // Rule `when:` parameters are positional-only, so this is the only
+        // place a binding's entity type is declared explicitly.
+        let mut command_param_types: HashMap<&str, Vec<Option<&str>>> = HashMap::new();
+        for surface in self.blocks(BlockKind::Surface) {
+            for item in &surface.items {
+                let BlockItemKind::Clause { keyword, value } = &item.kind else {
+                    continue;
+                };
+                if keyword == "provides" {
+                    collect_command_param_types(value, &status_by_entity, &mut command_param_types);
+                }
+            }
+        }
+
         let mut assigned_by_entity: HashMap<&str, HashSet<&str>> = HashMap::new();
         let mut transitions_by_entity: HashMap<&str, HashMap<&str, HashSet<&str>>> =
             HashMap::new();
         let mut created_issues: Vec<Diagnostic> = Vec::new();
 
         for rule in self.blocks(BlockKind::Rule) {
-            let binding_types = collect_rule_binding_types(rule, &status_by_entity);
+            let mut binding_types = collect_rule_binding_types(rule, &status_by_entity);
+            augment_binding_types_from_commands(rule, &command_param_types, &mut binding_types);
             let mut requires_by_binding: HashMap<&str, HashSet<&str>> = HashMap::new();
 
             for item in &rule.items {
@@ -921,7 +967,7 @@ impl Ctx<'_> {
                 Some(n) => n.name.as_str(),
                 None => continue,
             };
-            let mut trigger_name: Option<&str> = None;
+            let mut trigger_ref: Option<TriggerRef<'_>> = None;
             let mut requires_statuses: HashMap<&str, HashSet<&str>> = HashMap::new();
             let mut requires_fields: Vec<(String, String, String)> = Vec::new();
             let mut ensures_statuses: Vec<(&str, &str)> = Vec::new();
@@ -932,15 +978,19 @@ impl Ctx<'_> {
                     continue;
                 };
                 if keyword == "when" {
-                    let names = extract_trigger_names(value);
-                    if let Some((name, _)) = names.first() {
-                        trigger_name = Some(*name);
+                    let mut refs = extract_trigger_refs(value);
+                    if !refs.is_empty() {
+                        trigger_ref = Some(refs.remove(0));
                     }
                 }
             }
 
-            let trigger_reachable = trigger_name.map_or(true, |t| {
-                surface_triggers.contains(t) || emitted_triggers.contains(t)
+            // Indeterminate reachability (qualified trigger with no
+            // cross-module context) counts as reachable: never penalise
+            // what we cannot see.
+            let trigger_reachable = trigger_ref.as_ref().map_or(true, |t| {
+                self.trigger_reachability(t, &surface_triggers, &emitted_triggers)
+                    .unwrap_or(true)
             });
 
             let binding_types = collect_rule_binding_types(rule, &status_values_for_binding(&status_values));
@@ -1306,7 +1356,7 @@ impl Ctx<'_> {
         }
 
         // Unreachable trigger findings — aggregate per trigger
-        let mut unreachable_by_trigger: HashMap<&str, Vec<(&str, Vec<String>)>> = HashMap::new();
+        let mut unreachable_by_trigger: HashMap<String, Vec<(&str, Vec<String>)>> = HashMap::new();
         for rule in self.blocks(BlockKind::Rule) {
             let rule_name = match &rule.name {
                 Some(n) => n.name.as_str(),
@@ -1319,16 +1369,17 @@ impl Ctx<'_> {
                 if keyword != "when" {
                     continue;
                 }
-                let trigger_names = extract_trigger_names(value);
-                for (name, _span) in trigger_names {
-                    if !surface_triggers.contains(name) && !emitted_triggers.contains(name) {
+                for tref in extract_trigger_refs(value) {
+                    if self.trigger_reachability(&tref, &surface_triggers, &emitted_triggers)
+                        == Some(false)
+                    {
                         // Find entity bindings for this rule
                         let rule_data = rules.iter().find(|r| r.name == rule_name);
                         let bindings = rule_data
                             .map(|r| r.entity_bindings.clone())
                             .unwrap_or_default();
                         unreachable_by_trigger
-                            .entry(name)
+                            .entry(tref.display())
                             .or_default()
                             .push((rule_name, bindings));
                     }
@@ -2353,6 +2404,106 @@ fn collect_binding_types_from_expr<'a>(
     }
 }
 
+/// Collect command name → positional parameter entity types from a surface
+/// `provides:` expression. A parameter contributes a type when it is declared
+/// with a `name: Entity` annotation and the entity has a status enum.
+fn collect_command_param_types<'a, V>(
+    expr: &'a Expr,
+    status_by_entity: &HashMap<&str, V>,
+    out: &mut HashMap<&'a str, Vec<Option<&'a str>>>,
+) {
+    match expr {
+        Expr::Call { function, args, .. } => {
+            if let Expr::Ident(fn_name) = function.as_ref() {
+                let params: Vec<Option<&str>> = args
+                    .iter()
+                    .map(|arg| match arg {
+                        CallArg::Named(named) => match &named.value {
+                            Expr::Ident(val)
+                                if status_by_entity.contains_key(val.name.as_str()) =>
+                            {
+                                Some(val.name.as_str())
+                            }
+                            _ => None,
+                        },
+                        CallArg::Positional(_) => None,
+                    })
+                    .collect();
+                if params.iter().any(Option::is_some) {
+                    out.insert(&fn_name.name, params);
+                }
+            }
+        }
+        Expr::WhenGuard { action, .. } => {
+            collect_command_param_types(action, status_by_entity, out);
+        }
+        Expr::Block { items, .. } => {
+            for item in items {
+                collect_command_param_types(item, status_by_entity, out);
+            }
+        }
+        Expr::Conditional {
+            branches,
+            else_body,
+            ..
+        } => {
+            for branch in branches {
+                collect_command_param_types(&branch.body, status_by_entity, out);
+            }
+            if let Some(body) = else_body {
+                collect_command_param_types(body, status_by_entity, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Augment a rule's binding types with the surface-declared parameter types of
+/// the command it subscribes to, matched positionally against the rule's
+/// `when:` arguments. Explicit binding types already collected win.
+fn augment_binding_types_from_commands<'a>(
+    rule: &'a BlockDecl,
+    command_param_types: &HashMap<&str, Vec<Option<&'a str>>>,
+    out: &mut HashMap<&'a str, &'a str>,
+) {
+    for item in &rule.items {
+        let BlockItemKind::Clause { keyword, value } = &item.kind else {
+            continue;
+        };
+        if keyword != "when" {
+            continue;
+        }
+        augment_binding_types_from_call(value, command_param_types, out);
+    }
+}
+
+fn augment_binding_types_from_call<'a>(
+    expr: &'a Expr,
+    command_param_types: &HashMap<&str, Vec<Option<&'a str>>>,
+    out: &mut HashMap<&'a str, &'a str>,
+) {
+    match expr {
+        Expr::Call { function, args, .. } => {
+            if let Expr::Ident(fn_name) = function.as_ref() {
+                if let Some(params) = command_param_types.get(fn_name.name.as_str()) {
+                    for (arg, param_type) in args.iter().zip(params) {
+                        if let (CallArg::Positional(Expr::Ident(binding)), Some(entity)) =
+                            (arg, param_type)
+                        {
+                            out.entry(&binding.name).or_insert(entity);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::LogicalOp { left, right, .. } => {
+            augment_binding_types_from_call(left, command_param_types, out);
+            augment_binding_types_from_call(right, command_param_types, out);
+        }
+        _ => {}
+    }
+}
+
 fn extract_entity_from_trigger(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Becomes { subject, .. } | Expr::TransitionsTo { subject, .. } => {
@@ -2583,6 +2734,33 @@ fn visit_status_comparisons<'a>(
                 // transition building to avoid cross-contamination when the
                 // same root binding accesses different entities. Nested
                 // assignments are still tracked for reachability.
+            }
+        }
+        Expr::Comparison {
+            left,
+            op: ComparisonOp::NotEq,
+            right,
+            ..
+        } => {
+            // `binding.status != value` covers every other status value of the
+            // entity, so each value in the complement set gains an exit edge.
+            if let Some(target) = expr_as_ident(right) {
+                if let Some((binding, "status")) = expr_as_member_access(left) {
+                    if let Some(entity) = resolve_binding_entity(
+                        binding,
+                        Some(target),
+                        binding_types,
+                        status_by_entity,
+                    ) {
+                        if let Some((_, values)) = status_by_entity.get(entity) {
+                            if values.contains(target) {
+                                for value in values.iter().filter(|v| **v != target) {
+                                    cb(binding, value);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Expr::LogicalOp { left, right, .. } => {
@@ -2966,21 +3144,57 @@ impl Ctx<'_> {
                 if keyword != "when" {
                     continue;
                 }
-                let trigger_names = extract_trigger_names(value);
-                for (name, span) in trigger_names {
-                    if !provided.contains(name) && !emitted.contains(name) {
-                        self.push(
-                            Diagnostic::info(
-                                span,
-                                format!(
-                                    "Rule '{rule_name}' listens for trigger '{name}' but no local surface provides or rule emits it.",
-                                ),
-                            )
-                            .with_code("allium.rule.unreachableTrigger"),
-                        );
+                for tref in extract_trigger_refs(value) {
+                    if self.trigger_reachability(&tref, &provided, &emitted) != Some(false) {
+                        continue;
                     }
+                    let message = match tref.qualifier {
+                        None => format!(
+                            "Rule '{rule_name}' listens for trigger '{}' but no local surface provides or rule emits it.",
+                            tref.name,
+                        ),
+                        Some(q) => format!(
+                            "Rule '{rule_name}' listens for trigger '{q}/{}' but imported module '{q}' does not provide or emit it.",
+                            tref.name,
+                        ),
+                    };
+                    self.push(
+                        Diagnostic::info(tref.span, message)
+                            .with_code("allium.rule.unreachableTrigger"),
+                    );
                 }
             }
+        }
+    }
+
+    /// Reachability of a `when:` trigger reference. `Some(true)` — a local
+    /// surface provides it, a local rule emits it, or (in multi-file mode) an
+    /// imported module provides or emits it. `Some(false)` — determinately
+    /// unreachable. `None` — unknowable: a qualified reference in single-file
+    /// mode, or an alias whose target is outside the check set. Callers must
+    /// not flag `None`.
+    fn trigger_reachability(
+        &self,
+        tref: &TriggerRef<'_>,
+        provided: &HashSet<&str>,
+        emitted: &HashSet<&str>,
+    ) -> Option<bool> {
+        match tref.qualifier {
+            None => {
+                if provided.contains(tref.name) || emitted.contains(tref.name) {
+                    return Some(true);
+                }
+                if let Some(imports) = self.imported_triggers {
+                    if imports.values().any(|set| set.contains(tref.name)) {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            Some(q) => self
+                .imported_triggers?
+                .get(q)
+                .map(|set| set.contains(tref.name)),
         }
     }
 }
@@ -3015,7 +3229,10 @@ fn collect_emitted_trigger_from_item<'a>(kind: &'a BlockItemKind, out: &mut Hash
 
 /// Extract only the leading PascalCase call from an ensures expression,
 /// matching the TS regex which captures only the first identifier followed
-/// by `(` after `ensures:`.
+/// by `(` after `ensures:`. An `if`/`else if`/`else` conditional contributes
+/// the leading call of each branch body, and a `for` iteration the leading
+/// call of its body — a trigger emitted on any branch is an emission
+/// (issue #19); the TS branch-call lane collects the same set.
 fn collect_leading_ensures_call<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) {
     match expr {
         Expr::Call { function, .. } => {
@@ -3029,6 +3246,21 @@ fn collect_leading_ensures_call<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) 
             if let Some(first) = items.first() {
                 collect_leading_ensures_call(first, out);
             }
+        }
+        Expr::Conditional {
+            branches,
+            else_body,
+            ..
+        } => {
+            for b in branches {
+                collect_leading_ensures_call(&b.body, out);
+            }
+            if let Some(body) = else_body {
+                collect_leading_ensures_call(body, out);
+            }
+        }
+        Expr::For { body, .. } => {
+            collect_leading_ensures_call(body, out);
         }
         _ => {}
     }
@@ -3063,23 +3295,46 @@ fn collect_call_names<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) {
     }
 }
 
-fn extract_trigger_names(expr: &Expr) -> Vec<(&str, Span)> {
-    match expr {
-        Expr::Call { function, .. } => {
-            if let Expr::Ident(id) = function.as_ref() {
-                if starts_uppercase(&id.name) {
-                    return vec![(&id.name, id.span)];
-                }
-            }
-            vec![]
+/// A trigger reference in a `when:` clause: optional `use`-alias qualifier
+/// (`emitter/Pinged`), the trigger name, and the span to anchor diagnostics.
+struct TriggerRef<'a> {
+    qualifier: Option<&'a str>,
+    name: &'a str,
+    span: Span,
+}
+
+impl TriggerRef<'_> {
+    /// Display form for diagnostics and findings: `name` or `alias/name`.
+    fn display(&self) -> String {
+        match self.qualifier {
+            Some(q) => format!("{q}/{}", self.name),
+            None => self.name.to_string(),
         }
+    }
+}
+
+fn extract_trigger_refs(expr: &Expr) -> Vec<TriggerRef<'_>> {
+    match expr {
+        Expr::Call { function, .. } => match function.as_ref() {
+            Expr::Ident(id) if starts_uppercase(&id.name) => vec![TriggerRef {
+                qualifier: None,
+                name: &id.name,
+                span: id.span,
+            }],
+            Expr::QualifiedName(q) if starts_uppercase(&q.name) => vec![TriggerRef {
+                qualifier: q.qualifier.as_deref(),
+                name: &q.name,
+                span: q.span,
+            }],
+            _ => vec![],
+        },
         Expr::Binding { .. } => {
             // binding: Entity.field becomes ... — not a trigger call
             vec![]
         }
         Expr::LogicalOp { left, right, .. } => {
-            let mut out = extract_trigger_names(left);
-            out.extend(extract_trigger_names(right));
+            let mut out = extract_trigger_refs(left);
+            out.extend(extract_trigger_refs(right));
             out
         }
         _ => vec![],
@@ -3482,7 +3737,12 @@ fn collect_uppercase_idents_from_item<'a>(kind: &'a BlockItemKind, out: &mut Has
         }
         BlockItemKind::ContractsClause { entries } => {
             for e in entries {
-                out.insert(e.name.name.as_str());
+                // A qualified entry (`fulfils base/MyContract`) references the
+                // imported module's contract, not a local declaration with the
+                // same name — those are collected as qualified references.
+                if e.qualifier.is_none() {
+                    out.insert(e.name.name.as_str());
+                }
             }
         }
         _ => {}
@@ -3714,6 +3974,37 @@ pub fn collect_declared_names(module: &Module) -> HashSet<String> {
     names
 }
 
+/// Collect the trigger names a module makes available to listeners: triggers
+/// provided by its surfaces plus triggers emitted by its rules' ensures
+/// clauses (the same sets the unreachable-trigger check consults locally).
+///
+/// Used by multi-file checking to build the per-alias trigger map that lets
+/// `when: alias/Trigger(...)` subscriptions resolve across `use` imports.
+pub fn collect_trigger_outputs(module: &Module) -> HashSet<String> {
+    let mut names: HashSet<&str> = HashSet::new();
+    for d in &module.declarations {
+        let Decl::Block(b) = d else { continue };
+        match b.kind {
+            BlockKind::Surface => {
+                for item in &b.items {
+                    if let BlockItemKind::Clause { keyword, value } = &item.kind {
+                        if keyword == "provides" {
+                            collect_call_names(value, &mut names);
+                        }
+                    }
+                }
+            }
+            BlockKind::Rule => {
+                for item in &b.items {
+                    collect_emitted_trigger_from_item(&item.kind, &mut names);
+                }
+            }
+            _ => {}
+        }
+    }
+    names.into_iter().map(str::to_string).collect()
+}
+
 fn collect_qrefs_from_item(kind: &BlockItemKind, out: &mut Vec<(String, String)>) {
     match kind {
         BlockItemKind::Clause { value, .. }
@@ -3755,9 +4046,15 @@ fn collect_qrefs_from_item(kind: &BlockItemKind, out: &mut Vec<(String, String)>
                 }
             }
         }
-        // ContractsClause, EnumVariant, Annotation, OpenQuestion,
-        // TransitionsBlock — none of these contain expressions that could hold
-        // qualified names.
+        BlockItemKind::ContractsClause { entries } => {
+            for e in entries {
+                if let Some(ref qualifier) = e.qualifier {
+                    out.push((qualifier.clone(), e.name.name.clone()));
+                }
+            }
+        }
+        // EnumVariant, Annotation, OpenQuestion, TransitionsBlock — none of
+        // these contain expressions that could hold qualified names.
         _ => {}
     }
 }
@@ -3900,35 +4197,83 @@ fn collect_qrefs_from_expr(expr: &Expr, out: &mut Vec<(String, String)>) {
 // ---------------------------------------------------------------------------
 
 impl Ctx<'_> {
-    fn check_deferred_location_hints(&mut self) {
+    fn check_deferred_location_hints(&mut self, source: &str) {
         for d in &self.module.declarations {
             let Decl::Deferred(def) = d else {
                 continue;
             };
-            // The TypeScript check looks for a string literal or URL on the deferred line.
-            // Since the Rust parser only stores the path expression, we emit a warning
-            // if there's no additional hint (the parser doesn't capture comments/URLs).
+            // A deferred declaration carries a location hint when the text after the
+            // name points at where the detail lives: a quoted path, a URL, or the
+            // `-- see:` comment convention shown in the language reference. The AST
+            // drops the trailing comment, so scan the raw source. The TypeScript
+            // analyzer is line-based: it matches
+            // `^\s*deferred\s+([A-Za-z_][A-Za-z0-9_.]*)(.*)$` and applies the
+            // predicate to the suffix after the captured name. Replay that match
+            // from the `deferred` keyword rather than trusting the parsed path's
+            // span — the parsed expression can extend past the flat name (qualified
+            // `alias/Name` paths, expression-shaped paths like `Foo("x")`) or start
+            // after it (`deferred (Foo)`), which would move the suffix boundary and
+            // flip the verdict. Scanning the suffix (not the whole line) matters for
+            // the URL markers, whose leading letters would otherwise be misread as
+            // part of an unspaced path (e.g. `Foohttps://x`).
+            // The JavaScript `m` flag anchors `^`/`$` at `\n`, `\r`, U+2028 and
+            // U+2029, and `.` excludes them — and the Rust lexer accepts a bare
+            // `\r` as ordinary whitespace, so lone-CR files parse cleanly. Use
+            // the same terminator set for both line boundaries or the verdicts
+            // drift on such files.
+            const LINE_TERMINATORS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+            let bytes = source.as_bytes();
+            let kw_start = def.span.start;
+            let line_start = source[..kw_start]
+                .rfind(LINE_TERMINATORS)
+                .map_or(0, |i| {
+                    i + source[i..].chars().next().map_or(1, char::len_utf8)
+                });
+            let mut name_start = kw_start + "deferred".len();
+            while bytes.get(name_start).is_some_and(u8::is_ascii_whitespace) {
+                name_start += 1;
+            }
+            let starts_name =
+                |b: &u8| b.is_ascii_alphabetic() || *b == b'_';
+            let continues_name =
+                |b: &u8| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.';
+            if !bytes[line_start..kw_start]
+                .iter()
+                .all(|b| b.is_ascii_whitespace())
+                || name_start == kw_start + "deferred".len()
+                || !bytes.get(name_start).is_some_and(starts_name)
+            {
+                // A line the TypeScript regex cannot match — text before the
+                // keyword, no whitespace after it, or a path it cannot capture
+                // (e.g. `deferred (Foo)`) — produces no finding there; mirror that.
+                continue;
+            }
+            let mut name_end = name_start + 1;
+            while bytes.get(name_end).is_some_and(continues_name) {
+                name_end += 1;
+            }
+            let line_end = source[name_end..]
+                .find(LINE_TERMINATORS)
+                .map_or(source.len(), |i| name_end + i);
+            let suffix = &source[name_end..line_end];
+            if suffix.contains('"')
+                || suffix.contains("http://")
+                || suffix.contains("https://")
+                || suffix.contains("-- see:")
+            {
+                continue;
+            }
             self.push(
                 Diagnostic::warning(
                     def.span,
                     format!(
                         "Deferred specification '{}' should include a location hint.",
-                        expr_to_dotpath(&def.path),
+                        &source[name_start..name_end],
                     ),
                 )
                 .with_code("allium.deferred.missingLocationHint"),
             );
         }
-    }
-}
-
-fn expr_to_dotpath(expr: &Expr) -> String {
-    match expr {
-        Expr::Ident(id) => id.name.clone(),
-        Expr::MemberAccess { object, field, .. } => {
-            format!("{}.{}", expr_to_dotpath(object), field.name)
-        }
-        _ => "?".to_string(),
     }
 }
 
@@ -3969,9 +4314,16 @@ impl Ctx<'_> {
 
 fn is_valid_trigger(expr: &Expr) -> bool {
     match expr {
-        // EventName(params...) — external stimulus trigger
+        // EventName(params...) — external stimulus trigger. A qualified
+        // function (`alias/EventName(...)`) subscribes to a trigger from an
+        // imported spec, per the language reference's "Responding to external
+        // triggers" section; the TS `isValidTriggerShape` accepts the same
+        // form.
         Expr::Call { function, .. } => {
-            matches!(function.as_ref(), Expr::Ident(_) | Expr::MemberAccess { .. })
+            matches!(
+                function.as_ref(),
+                Expr::Ident(_) | Expr::MemberAccess { .. } | Expr::QualifiedName(_)
+            )
         }
         // binding: Entity.field becomes/transitions_to/created/comparison
         Expr::Binding { value, .. } => {
@@ -4133,8 +4485,14 @@ fn collect_bound_names<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) {
         }
         Expr::Call { args, .. } => {
             for arg in args {
-                if let CallArg::Positional(Expr::Ident(id)) = arg {
-                    out.insert(&id.name);
+                match arg {
+                    CallArg::Positional(Expr::Ident(id)) => {
+                        out.insert(&id.name);
+                    }
+                    CallArg::Named(named) if is_type_annotation_expr(&named.value) => {
+                        out.insert(&named.name.name);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -4143,6 +4501,21 @@ fn collect_bound_names<'a>(expr: &'a Expr, out: &mut HashSet<&'a str>) {
             collect_bound_names(right, out);
         }
         _ => {}
+    }
+}
+
+fn is_type_annotation_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident(id) => starts_uppercase(&id.name),
+        Expr::QualifiedName(q) => starts_uppercase(&q.name),
+        Expr::GenericType { name, args, .. } => {
+            is_type_annotation_expr(name) && args.iter().all(is_type_annotation_expr)
+        }
+        Expr::Pipe { left, right, .. } => {
+            is_type_annotation_expr(left) && is_type_annotation_expr(right)
+        }
+        Expr::TypeOptional { inner, .. } => is_type_annotation_expr(inner),
+        _ => false,
     }
 }
 
@@ -4740,6 +5113,39 @@ mod tests {
         assert!(!has_code(&ds, "allium.surface.unusedBinding"));
     }
 
+    // -- Rule bindings --
+
+    #[test]
+    fn typed_call_trigger_param_is_bound() {
+        let ds = analyze_src(
+            "entity Account {\n  name: String\n}\n\n\
+             entity Greeting {\n  label: String\n}\n\n\
+             rule TypedParam {\n  when: AccountSeen(account: Account)\n  \
+             ensures: Greeting.created(label: account.name)\n}\n",
+        );
+        assert!(!has_code(&ds, "allium.rule.undefinedBinding"));
+    }
+
+    #[test]
+    fn generic_typed_call_trigger_param_is_bound() {
+        let ds = analyze_src(
+            "entity Account {\n  name: String\n}\n\n\
+             entity Greeting {\n  label: String\n}\n\n\
+             rule GenericTypedParam {\n  when: AccountsSeen(accounts: List<Account>)\n  \
+             ensures: Greeting.created(label: accounts.count)\n}\n",
+        );
+        assert!(!has_code(&ds, "allium.rule.undefinedBinding"));
+    }
+
+    #[test]
+    fn named_literal_trigger_arg_is_not_binding() {
+        let ds = analyze_src(
+            "rule LiteralFilter {\n  when: CommandInvoked(name: \"npm run test\")\n  \
+             requires: name.status = active\n  ensures: Done()\n}\n",
+        );
+        assert!(has_code(&ds, "allium.rule.undefinedBinding"));
+    }
+
     // -- Status state machine --
 
     #[test]
@@ -4748,6 +5154,54 @@ mod tests {
             "entity Quote {\n  status: pending | quoted | filled\n}\n\n\
              rule ApplyStatusUpdate {\n  when: update: Quote.status becomes pending\n  \
              ensures: update.status = new_status\n}\n",
+        );
+        assert!(!has_code(&ds, "allium.status.unreachableValue"));
+        assert!(!has_code(&ds, "allium.status.noExit"));
+    }
+
+    #[test]
+    fn surface_param_types_disambiguate_shared_status_values() {
+        // Two entities share the status value `active`. The rule bindings can
+        // only be typed via the surface `provides:` parameter annotations.
+        let ds = analyze_src(
+            "entity Account {\n  status: active | suspended\n}\n\n\
+             entity Subscription {\n  status: active | expired | cancelled\n}\n\n\
+             surface AccountAdmin {\n  facing admin: Admin\n  provides:\n    \
+             SuspendAccount(admin, account: Account)\n      when account.status = active\n    \
+             ReinstateAccount(admin, account: Account)\n      when account.status = suspended\n}\n\n\
+             surface SubscriptionAdmin {\n  facing admin: Admin\n  provides:\n    \
+             CancelSubscription(admin, sub: Subscription)\n      when sub.status = active\n    \
+             RenewSubscription(admin, sub: Subscription)\n      when sub.status != active\n    \
+             ExpireSubscription(admin, sub: Subscription)\n      when sub.status = active\n}\n\n\
+             rule AccountSuspended {\n  when: SuspendAccount(admin, account)\n  \
+             requires: account.status = active\n  ensures: account.status = suspended\n}\n\n\
+             rule AccountReinstated {\n  when: ReinstateAccount(admin, account)\n  \
+             requires: account.status = suspended\n  ensures: account.status = active\n}\n\n\
+             rule SubscriptionCancelled {\n  when: CancelSubscription(admin, sub)\n  \
+             requires: sub.status = active\n  ensures: sub.status = cancelled\n}\n\n\
+             rule SubscriptionExpired {\n  when: ExpireSubscription(admin, sub)\n  \
+             requires: sub.status = active\n  ensures: sub.status = expired\n}\n\n\
+             rule SubscriptionRenewed {\n  when: RenewSubscription(admin, sub)\n  \
+             requires: sub.status != active\n  ensures: sub.status = active\n}\n",
+        );
+        assert!(!has_code(&ds, "allium.status.unreachableValue"));
+        assert!(!has_code(&ds, "allium.status.noExit"));
+    }
+
+    #[test]
+    fn negated_requires_counts_as_exit_for_complement_values() {
+        // `requires: order.status != draft` must give every other status value
+        // an exit edge, so none of them is reported as having no exit.
+        let ds = analyze_src(
+            "entity Order {\n  status: draft | submitted | approved | rejected\n}\n\n\
+             rule OrderSubmitted {\n  when: SubmitOrder(clerk, order)\n  \
+             requires: order.status = draft\n  ensures: order.status = submitted\n}\n\n\
+             rule OrderApproved {\n  when: ApproveOrder(clerk, order)\n  \
+             requires: order.status = submitted\n  ensures: order.status = approved\n}\n\n\
+             rule OrderRejected {\n  when: RejectOrder(clerk, order)\n  \
+             requires: order.status = submitted\n  ensures: order.status = rejected\n}\n\n\
+             rule OrderReactivated {\n  when: ReactivateOrder(clerk, order)\n  \
+             requires: order.status != draft\n  ensures: order.status = draft\n}\n",
         );
         assert!(!has_code(&ds, "allium.status.unreachableValue"));
         assert!(!has_code(&ds, "allium.status.noExit"));
@@ -5099,6 +5553,135 @@ mod tests {
         assert!(has_code(&ds, "allium.rule.unreachableTrigger"));
     }
 
+    /// Helper for the cross-module unreachable-trigger tests: analyse `src`
+    /// in multi-file mode with the given alias → trigger-names map.
+    fn analyze_with_imports(
+        src: &str,
+        imports: &[(&str, &[&str])],
+    ) -> Vec<Diagnostic> {
+        let input = format!("-- allium: 3\n{src}");
+        let result = parse(&input);
+        let imported: HashMap<String, HashSet<String>> = imports
+            .iter()
+            .map(|(alias, triggers)| {
+                (
+                    alias.to_string(),
+                    triggers.iter().map(|t| t.to_string()).collect(),
+                )
+            })
+            .collect();
+        analyze_with_cross_module(
+            &result.module,
+            &input,
+            &HashSet::new(),
+            &HashSet::new(),
+            &imported,
+        )
+    }
+
+    #[test]
+    fn qualified_trigger_suppressed_in_single_file_mode() {
+        // Single-file analysis cannot see the imported module, so a
+        // `use`-qualified subscription is never flagged (issue #19).
+        let ds = analyze_src(
+            "use \"./emitter.allium\" as emitter\n\nrule HandlePing {\n  when: emitter/Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n",
+        );
+        assert!(!has_code(&ds, "allium.rule.unreachableTrigger"));
+    }
+
+    #[test]
+    fn qualified_trigger_reachable_via_imported_module() {
+        let ds = analyze_with_imports(
+            "use \"./emitter.allium\" as emitter\n\nrule HandlePing {\n  when: emitter/Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n",
+            &[("emitter", &["Pinged"])],
+        );
+        assert!(!has_code(&ds, "allium.rule.unreachableTrigger"));
+    }
+
+    #[test]
+    fn qualified_trigger_unreachable_when_imported_module_lacks_it() {
+        let ds = analyze_with_imports(
+            "use \"./emitter.allium\" as emitter\n\nrule HandlePing {\n  when: emitter/Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n",
+            &[("emitter", &["SomethingElse"])],
+        );
+        let flagged: Vec<&Diagnostic> = ds
+            .iter()
+            .filter(|d| d.code == Some("allium.rule.unreachableTrigger"))
+            .collect();
+        assert_eq!(flagged.len(), 1);
+        assert!(flagged[0].message.contains("'emitter/Pinged'"));
+        assert!(flagged[0].message.contains("imported module 'emitter'"));
+    }
+
+    #[test]
+    fn qualified_trigger_suppressed_for_alias_outside_check_set() {
+        // The alias's target did not resolve to a file in the check set
+        // (external coordinate or missing file): reachability is unknowable.
+        let ds = analyze_with_imports(
+            "use \"github.com/allium-specs/oauth/abc\" as oauth\n\nrule Audit {\n  when: oauth/SessionCreated(session)\n  ensures: Logged(session: session)\n}\n",
+            &[],
+        );
+        assert!(!has_code(&ds, "allium.rule.unreachableTrigger"));
+    }
+
+    #[test]
+    fn unqualified_trigger_reachable_via_imported_module() {
+        let ds = analyze_with_imports(
+            "use \"./emitter.allium\" as emitter\n\nrule HandlePing {\n  when: Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n",
+            &[("emitter", &["Pinged"])],
+        );
+        assert!(!has_code(&ds, "allium.rule.unreachableTrigger"));
+    }
+
+    #[test]
+    fn unqualified_trigger_still_flagged_when_no_import_emits_it() {
+        let ds = analyze_with_imports(
+            "use \"./emitter.allium\" as emitter\n\nrule HandlePing {\n  when: Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n",
+            &[("emitter", &["SomethingElse"])],
+        );
+        assert!(has_code(&ds, "allium.rule.unreachableTrigger"));
+    }
+
+    #[test]
+    fn conditional_ensures_emission_registers() {
+        // A trigger emitted on an `else` branch of an ensures conditional
+        // reaches listeners (issue #19).
+        let ds = analyze_src(
+            "rule AdvertRouted {\n  when: AdvertReceived(envelope)\n  ensures:\n    if exists envelope:\n      Logged(envelope: envelope)\n    else:\n      SensorAdvertDecoded(advert: envelope)\n}\n\nrule HandleDecoded {\n  when: SensorAdvertDecoded(advert)\n  ensures: Done(advert: advert)\n}\n\nrule HandleLogged {\n  when: Logged(envelope)\n  ensures: Done2(envelope: envelope)\n}\n",
+        );
+        let unreachable: Vec<&Diagnostic> = ds
+            .iter()
+            .filter(|d| d.code == Some("allium.rule.unreachableTrigger"))
+            .collect();
+        // AdvertReceived itself has no emitter; the two branch-emitted
+        // triggers must not be flagged.
+        assert_eq!(unreachable.len(), 1);
+        assert!(unreachable[0].message.contains("'AdvertReceived'"));
+    }
+
+    #[test]
+    fn for_body_ensures_emission_registers() {
+        let ds = analyze_src(
+            "rule Fan {\n  when: Broadcast(msg)\n  ensures:\n    for user in Users:\n      Notified(user: user, msg: msg)\n}\n\nrule HandleNotified {\n  when: Notified(user, msg)\n  ensures: Done()\n}\n",
+        );
+        let unreachable: Vec<&Diagnostic> = ds
+            .iter()
+            .filter(|d| d.code == Some("allium.rule.unreachableTrigger"))
+            .collect();
+        assert_eq!(unreachable.len(), 1);
+        assert!(unreachable[0].message.contains("'Broadcast'"));
+    }
+
+    #[test]
+    fn collect_trigger_outputs_includes_provides_ensures_and_branches() {
+        let input = "-- allium: 3\nsurface S {\n  provides:\n    Submit(x)\n}\n\nrule R {\n  when: Submit(x)\n  ensures:\n    if exists x:\n      Accepted(x: x)\n    else:\n      Rejected(x: x)\n}\n";
+        let result = parse(input);
+        let outputs = collect_trigger_outputs(&result.module);
+        assert!(outputs.contains("Submit"));
+        assert!(outputs.contains("Accepted"));
+        assert!(outputs.contains("Rejected"));
+    }
+
     // -- Unused fields --
 
     #[test]
@@ -5335,7 +5918,7 @@ mod tests {
         let input = format!("-- allium: 3\n{src}");
         let result = parse(&input);
         let resolved: HashSet<String> = ["./core.allium".to_string()].into_iter().collect();
-        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved);
+        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved, &HashMap::new());
         assert!(!has_code(&ds, "allium.use.unresolvedPath"));
     }
 
@@ -5346,7 +5929,7 @@ mod tests {
         let result = parse(&input);
         // Only "./other.allium" is resolved — "./missing.allium" is not.
         let resolved: HashSet<String> = ["./other.allium".to_string()].into_iter().collect();
-        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved);
+        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved, &HashMap::new());
         assert!(has_code(&ds, "allium.use.unresolvedPath"));
     }
 
@@ -5367,7 +5950,7 @@ mod tests {
         let src = "use \"./missing.allium\" as missing\n\nentity Handler {\n  x: String\n}\n";
         let input = format!("-- allium: 3\n{src}");
         let result = parse(&input);
-        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &HashSet::new());
+        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert!(has_code(&ds, "allium.use.unresolvedPath"));
     }
 
@@ -5377,7 +5960,7 @@ mod tests {
         let input = format!("-- allium: 3\n{src}");
         let result = parse(&input);
         let resolved: HashSet<String> = ["./other.allium".to_string()].into_iter().collect();
-        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved);
+        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved, &HashMap::new());
         let diag = ds.iter().find(|d| d.code == Some("allium.use.unresolvedPath")).unwrap();
         assert!(diag.message.contains("nowhere.allium"), "message should name the path: {}", diag.message);
     }
@@ -5388,7 +5971,7 @@ mod tests {
         let input = format!("-- allium: 3\n{src}");
         let result = parse(&input);
         let resolved: HashSet<String> = ["./other.allium".to_string()].into_iter().collect();
-        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved);
+        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved, &HashMap::new());
         assert!(!has_code(&ds, "allium.use.unresolvedPath"));
     }
 
@@ -5398,7 +5981,7 @@ mod tests {
         let input = format!("-- allium: 3\n{src}");
         let result = parse(&input);
         let resolved: HashSet<String> = ["./found.allium".to_string()].into_iter().collect();
-        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved);
+        let ds = analyze_with_cross_module(&result.module, &input, &HashSet::new(), &resolved, &HashMap::new());
         let unresolved: Vec<_> = ds.iter()
             .filter(|d| d.code == Some("allium.use.unresolvedPath"))
             .collect();
@@ -5414,11 +5997,130 @@ mod tests {
         assert!(has_code(&ds, "allium.deferred.missingLocationHint"));
     }
 
+    #[test]
+    fn deferred_with_quoted_path_hint_ok() {
+        let ds = analyze_src("deferred Foo.bar \"detailed/foo.allium\"\n");
+        assert!(!has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_with_see_comment_hint_ok() {
+        // The `-- see:` convention shown in the language reference counts as a hint.
+        let ds = analyze_src("deferred Foo.bar    -- see: detailed/foo.allium\n");
+        assert!(!has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_with_url_hint_ok() {
+        let ds = analyze_src("deferred Foo.bar    -- https://example.com/foo.allium\n");
+        assert!(!has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_with_url_glued_to_path_warns() {
+        // A URL marker with no space before it is part of the (unspaced) path, not a
+        // hint — matching the TypeScript analyzer, whose name capture eats `Foohttps`
+        // and leaves the suffix `://x`. Scanning the whole line would wrongly suppress.
+        assert!(has_code(
+            &analyze_src("deferred Foohttps://x\n"),
+            "allium.deferred.missingLocationHint"
+        ));
+        assert!(has_code(
+            &analyze_src("deferred Foohttp://x\n"),
+            "allium.deferred.missingLocationHint"
+        ));
+    }
+
+    #[test]
+    fn deferred_with_non_hint_comment_warns() {
+        // A trailing comment that is not a location hint must still warn; only the
+        // `-- see:` marker (or a quoted path / URL) suppresses.
+        let ds = analyze_src("deferred Foo.bar    -- TODO write this\n");
+        assert!(has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_expression_path_with_quote_suppresses() {
+        // The parsed path of an expression-shaped deferred declaration extends past
+        // the flat name, so a suffix scan anchored at `path.span().end` would miss
+        // the quote. The check replays the TypeScript name capture instead, so the
+        // quote lands in the suffix and suppresses — matching the TS analyzer.
+        let ds = analyze_src("deferred Foo(\"x\")\n");
+        assert!(!has_code(&ds, "allium.deferred.missingLocationHint"));
+        let ds = analyze_src("deferred Foo = \"x\"\n");
+        assert!(!has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_lone_cr_is_a_line_boundary() {
+        // JavaScript `m`-flag anchors treat a bare `\r` as a line terminator while
+        // the Rust lexer reads it as ordinary whitespace, so lone-CR files parse
+        // cleanly; the replayed match must split there too or the verdicts drift.
+        let ds = analyze_src("deferred Foo\rdeferred Bar\n");
+        let hints: Vec<&Diagnostic> = ds
+            .iter()
+            .filter(|d| d.code == Some("allium.deferred.missingLocationHint"))
+            .collect();
+        assert_eq!(hints.len(), 2, "both CR-separated declarations warn");
+        // The hint marker on the next CR-line must not leak into Foo's suffix.
+        let ds = analyze_src("deferred Foo\r-- see: x.allium\n");
+        assert!(has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_unmatchable_path_stays_silent() {
+        // The TypeScript regex requires `deferred` + whitespace + `[A-Za-z_]`; a
+        // parenthesised path never matches it (the paren is not part of the parsed
+        // path's span, so anchoring on the span would wrongly find a name).
+        let ds = analyze_src("deferred (Foo)\n");
+        assert!(!has_code(&ds, "allium.deferred.missingLocationHint"));
+    }
+
+    #[test]
+    fn deferred_qualified_path_warns_with_flat_name() {
+        // A qualified path parses past the `/`, but the TypeScript capture stops
+        // there; both warn, and the message carries the flat name (`billing`).
+        let ds = analyze_src("deferred billing/InvoiceWorkflow\n");
+        let hints: Vec<&Diagnostic> = ds
+            .iter()
+            .filter(|d| d.code == Some("allium.deferred.missingLocationHint"))
+            .collect();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].message.contains("'billing'"));
+    }
+
+    #[test]
+    fn deferred_location_hint_is_per_line() {
+        // `analyze_src` prepends a `-- allium: 3` header, so these are source lines
+        // 2-4; only the bare middle declaration should warn. Exercises real per-line
+        // suffix resolution across multiple deferred declarations.
+        let ds = analyze_src(
+            "deferred A.one    -- see: a.allium\ndeferred B.two\ndeferred C.three \"c.allium\"\n",
+        );
+        let hints: Vec<&Diagnostic> = ds
+            .iter()
+            .filter(|d| d.code == Some("allium.deferred.missingLocationHint"))
+            .collect();
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].message.contains("B.two"));
+    }
+
     // -- Invalid triggers --
 
     #[test]
     fn valid_trigger_ok() {
         let ds = analyze_src("rule A {\n  when: Ping(x)\n  ensures: Done()\n}\n");
+        assert!(!has_code(&ds, "allium.rule.invalidTrigger"));
+    }
+
+    #[test]
+    fn qualified_trigger_call_is_valid() {
+        // `when: alias/Trigger(...)` subscribes to an imported spec's trigger
+        // (language reference, "Responding to external triggers"); it must
+        // not be rejected as an unsupported trigger form (issue #19).
+        let ds = analyze_src(
+            "use \"./emitter.allium\" as emitter\n\nrule HandlePing {\n  when: emitter/Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n",
+        );
         assert!(!has_code(&ds, "allium.rule.invalidTrigger"));
     }
 

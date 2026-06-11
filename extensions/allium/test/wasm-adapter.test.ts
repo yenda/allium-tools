@@ -1,12 +1,41 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseAlliumBlocks } from "../src/language-tools/parser";
+import {
+	parseAlliumBlocks,
+	parseAlliumDocument,
+} from "../src/language-tools/parser";
 
 // --- Structural: WASM parser produces correct ParsedBlock output ---
 
 test("parser: empty file", () => {
 	const blocks = parseAlliumBlocks("");
 	assert.equal(blocks.length, 0);
+});
+
+test("parseAlliumDocument: exposes parse diagnostics alongside blocks", () => {
+	const doc = parseAlliumDocument("-- allium: 1\ndeferred Foo.");
+	assert.ok(
+		doc.diagnostics.some((d) => d.severity === "Error"),
+		"expected a parse error diagnostic",
+	);
+});
+
+test("parseAlliumDocument: qualified contract names parse cleanly (issue #21)", () => {
+	const doc = parseAlliumDocument(
+		'-- allium: 3\nuse "./base.allium" as base\n\nsurface MySurface {\n\tfacing user: base/Caller\n\tcontracts:\n\t\tfulfils base/MyContract\n\t\tdemands base/OtherContract\n}\n',
+	);
+	assert.equal(
+		doc.diagnostics.filter((d) => d.severity === "Error").length,
+		0,
+		`expected no parse errors, got ${JSON.stringify(doc.diagnostics)}`,
+	);
+});
+
+test("parseAlliumDocument: clean spec has no diagnostics", () => {
+	const doc = parseAlliumDocument(
+		"-- allium: 1\nentity Order {\n  total: Integer\n}\n",
+	);
+	assert.equal(doc.diagnostics.length, 0);
 });
 
 test("parser: single entity", () => {

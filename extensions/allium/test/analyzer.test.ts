@@ -1,10 +1,145 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { analyzeAllium } from "../src/language-tools/analyzer";
+import {
+  analyzeAllium,
+  maskCommentsAndStrings,
+} from "../src/language-tools/analyzer";
 
 test("reports missing ensures", () => {
   const findings = analyzeAllium(`rule A {\n  when: Ping()\n}`);
   assert.ok(findings.some((f) => f.code === "allium.rule.missingEnsures"));
+});
+
+// --- Comment/string awareness of the regex lanes (issue #28) ---
+
+test("mask: blanks comment content but keeps the -- and structure", () => {
+  const input = "entity A -- deferred Foo\nrule B";
+  const masked = maskCommentsAndStrings(input);
+  assert.equal(masked, "entity A --             \nrule B");
+  assert.equal(masked.length, input.length);
+});
+
+test("mask: blanks string content but keeps the quotes", () => {
+  assert.equal(maskCommentsAndStrings('x: "deferred Y"'), 'x: "          "');
+});
+
+test("mask: honours backslash escapes inside strings", () => {
+  // The escaped quote does not terminate the string, so the trailing content
+  // stays masked rather than being treated as code.
+  assert.equal(maskCommentsAndStrings('"a\\"b"'), '"    "');
+});
+
+test("mask: a lone CR does not end a -- comment", () => {
+  // The Rust lexer ends line comments only at \n, so text after a lone \r is
+  // still comment content and must be masked.
+  assert.equal(maskCommentsAndStrings("-- a\rdeferred Z"), "--             ");
+});
+
+test("does not warn on deferred-shaped text inside a comment (#28)", () => {
+  const findings = analyzeAllium("-- allium: 1\n-- deferred Foo\n");
+  assert.equal(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+    false,
+  );
+});
+
+test("does not warn on deferred-shaped text inside a string (#28)", () => {
+  const findings = analyzeAllium(
+    `-- allium: 1\nentity Order {\n  note: "deferred Foo"\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+    false,
+  );
+});
+
+test("does not warn on deferred after a lone CR inside a comment (#28)", () => {
+  const findings = analyzeAllium("-- allium: 1\n-- note\rdeferred Foo\n");
+  assert.equal(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+    false,
+  );
+});
+
+test("still warns on a real deferred declaration without a hint", () => {
+  const findings = analyzeAllium("-- allium: 1\ndeferred Foo\n");
+  assert.ok(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+  );
+});
+
+// String-literal value comparisons must use the raw literal text, not the
+// masked view where same-length literals collapse to the same spaces.
+
+test("neverFires: distinct same-length string literals are not contradictory", () => {
+  const findings = analyzeAllium(
+    `-- allium: 1\nrule R {\n  when: Ping()\n  requires: order.state = "a"\n  requires: order.state != "b"\n  ensures: order.flag = done\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.rule.neverFires"),
+    false,
+  );
+});
+
+test("neverFires: contradictory same-length string literals are detected", () => {
+  const findings = analyzeAllium(
+    `-- allium: 1\nrule R {\n  when: Ping()\n  requires: order.state = "aa"\n  requires: order.state = "bb"\n  ensures: order.flag = done\n}\n`,
+  );
+  assert.ok(findings.some((f) => f.code === "allium.rule.neverFires"));
+});
+
+test("impossibleWhen: contradictory same-length string literals are detected", () => {
+  const findings = analyzeAllium(
+    `-- allium: 1\nsurface Dash {\n  show grid when mode = "aa" and mode = "bb"\n}\n`,
+  );
+  assert.ok(findings.some((f) => f.code === "allium.surface.impossibleWhen"));
+});
+
+test("impossibleWhen: distinct expressions with string values are not contradictory", () => {
+  const findings = analyzeAllium(
+    `-- allium: 1\nsurface Dash {\n  show grid when mode = "aa" and theme = "bb"\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.surface.impossibleWhen"),
+    false,
+  );
+});
+
+test("still accepts a real deferred with a -- see: hint", () => {
+  const findings = analyzeAllium("-- allium: 1\ndeferred Foo -- see: bar.allium\n");
+  assert.equal(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+    false,
+  );
+});
+
+test("surfaces WASM parse errors as findings (issue #25)", () => {
+  // `deferred Foo.` is a parse error in `allium check`; previously the TS
+  // analyzer discarded the WASM parse diagnostics and stayed silent.
+  const findings = analyzeAllium(`-- allium: 1\ndeferred Foo.`);
+  const parseError = findings.find((f) => f.code === "allium.parse.error");
+  assert.ok(parseError, "expected an allium.parse.error finding");
+  assert.equal(parseError?.severity, "error");
+});
+
+test("surfaces the missing-version-marker parse warning", () => {
+  const findings = analyzeAllium(`entity Order {\n  total: Integer\n}`);
+  const versionWarning = findings.find(
+    (f) =>
+      f.code === "allium.parse.warning" && /version marker/.test(f.message),
+  );
+  assert.ok(versionWarning, "expected a version-marker parse warning");
+  assert.equal(versionWarning?.severity, "warning");
+});
+
+test("emits no parse findings for a well-formed spec", () => {
+  const findings = analyzeAllium(
+    `-- allium: 1\nentity Order {\n  total: Integer\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code.startsWith("allium.parse.")),
+    false,
+  );
 });
 
 test("reports missing when trigger", () => {
@@ -561,6 +696,35 @@ test("does not warn when named requires block has deferred hint", () => {
   );
 });
 
+test("does not warn when deferred hint is module-qualified", () => {
+  const findings = analyzeAllium(
+    `deferred billing/InvoiceWorkflow\n\nsurface Billing {\n  facing viewer: User\n  requires InvoiceWorkflow:\n    viewer.id != null\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.surface.requiresWithoutDeferred"),
+    false,
+  );
+});
+
+test("does not warn when module-qualified deferred hint has dotted name", () => {
+  const findings = analyzeAllium(
+    `deferred billing/Dashboard.ApprovalFlow\n\nsurface Dashboard {\n  facing viewer: User\n  requires ApprovalFlow:\n    viewer.id != null\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.surface.requiresWithoutDeferred"),
+    false,
+  );
+});
+
+test("warns when requires block matches only the alias of a qualified deferred hint", () => {
+  const findings = analyzeAllium(
+    `deferred billing/InvoiceWorkflow\n\nsurface Billing {\n  facing viewer: User\n  requires billing:\n    viewer.id != null\n}\n`,
+  );
+  assert.ok(
+    findings.some((f) => f.code === "allium.surface.requiresWithoutDeferred"),
+  );
+});
+
 test("reports duplicate named provides blocks in surface", () => {
   const findings = analyzeAllium(
     `surface Dashboard {\n  facing viewer: User\n  provides Navigate:\n    Opened()\n  provides Navigate:\n    Refreshed()\n}\n`,
@@ -613,6 +777,40 @@ test("does not report binding defined by trigger parameter", () => {
     findings.some((f) => f.code === "allium.rule.undefinedBinding"),
     false,
   );
+});
+
+test("does not report binding defined by typed trigger parameter", () => {
+  const findings = analyzeAllium(
+    `entity User {\n  status: String\n}\n\nrule Notify {\n  when: UserUpdated(user: User)\n  requires: user.status = active\n  ensures: Done()\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.rule.undefinedBinding"),
+    false,
+  );
+});
+
+test("does not report binding defined by generic typed trigger parameter", () => {
+  const findings = analyzeAllium(
+    `entity User {\n  status: String\n}\n\nrule Notify {\n  when: UsersUpdated(users: List<User?>, metadata: Map<String, String>)\n  requires: users.count > 0\n  requires: metadata.count > 0\n  ensures: Done()\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.rule.undefinedBinding"),
+    false,
+  );
+});
+
+test("does not treat named literal trigger argument as binding", () => {
+  const findings = analyzeAllium(
+    `rule Notify {\n  when: CommandInvoked(name: "npm run test")\n  requires: name.status = active\n  ensures: Done()\n}\n`,
+  );
+  assert.ok(findings.some((f) => f.code === "allium.rule.undefinedBinding"));
+});
+
+test("does not treat lowercase named trigger argument as typed binding", () => {
+  const findings = analyzeAllium(
+    `rule Notify {\n  when: FieldSelected(field: course_name)\n  requires: field.status = active\n  ensures: Done()\n}\n`,
+  );
+  assert.ok(findings.some((f) => f.code === "allium.rule.undefinedBinding"));
 });
 
 test("does not report binding defined in context block", () => {
@@ -690,6 +888,62 @@ test("does not warn when rule trigger is provided by a surface", () => {
   );
 });
 
+test("does not warn for qualified cross-spec trigger subscriptions", () => {
+  // `emitter/Pinged(...)` subscribes to a trigger emitted by an imported
+  // spec; single-file analysis cannot see the emitting module (issue #19).
+  const findings = analyzeAllium(
+    `use "./emitter.allium" as emitter\n\nrule HandlePing {\n  when: emitter/Pinged(subject)\n  ensures: PingHandled(subject: subject)\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.rule.unreachableTrigger"),
+    false,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.rule.invalidTrigger"),
+    false,
+  );
+});
+
+test("registers trigger emissions on conditional branches of ensures", () => {
+  // The else-branch emission must register so same-file listeners are not
+  // flagged as unreachable (issue #19).
+  const findings = analyzeAllium(
+    `rule AdvertRouted {\n  when: AdvertReceived(envelope)\n  ensures:\n    if exists envelope:\n      Logged(envelope: envelope)\n    else:\n      SensorAdvertDecoded(advert: envelope)\n}\n\nrule HandleDecoded {\n  when: SensorAdvertDecoded(advert)\n  ensures: Done(advert: advert)\n}\n\nrule HandleLogged {\n  when: Logged(envelope)\n  ensures: Done2(envelope: envelope)\n}\n`,
+  );
+  const unreachable = findings.filter(
+    (f) => f.code === "allium.rule.unreachableTrigger",
+  );
+  // Only AdvertReceived itself has no emitter.
+  assert.equal(unreachable.length, 1);
+  assert.ok(unreachable[0].message.includes("'AdvertReceived'"));
+});
+
+test("registers trigger emissions inside for iterations of ensures", () => {
+  const findings = analyzeAllium(
+    `rule Fan {\n  when: Broadcast(msg)\n  ensures:\n    for user in Users:\n      Notified(user: user, msg: msg)\n}\n\nrule HandleNotified {\n  when: Notified(user, msg)\n  ensures: Done()\n}\n`,
+  );
+  const unreachable = findings.filter(
+    (f) => f.code === "allium.rule.unreachableTrigger",
+  );
+  assert.equal(unreachable.length, 1);
+  assert.ok(unreachable[0].message.includes("'Broadcast'"));
+});
+
+test("conditional branch calls outside ensures clauses do not register as emissions", () => {
+  // The branch-emission lane is scoped to ensures clause extents: a call on
+  // a conditional branch of a `let` must not satisfy a listener.
+  const findings = analyzeAllium(
+    `rule Route {\n  when: Ping(envelope)\n  let advert = if exists envelope: Decoded(envelope) else: Fallback(envelope)\n  ensures: Done()\n}\n\nrule HandleDecoded {\n  when: Decoded(advert)\n  ensures: Finished()\n}\n`,
+  );
+  assert.ok(
+    findings.some(
+      (f) =>
+        f.code === "allium.rule.unreachableTrigger" &&
+        f.message.includes("'Decoded'"),
+    ),
+  );
+});
+
 test("warns when two rules have duplicate behavior", () => {
   const findings = analyzeAllium(
     `rule A {\n  when: Ping(user)\n  requires: user.status = active\n  ensures: Done()\n}\n\nrule B {\n  when: Ping(user)\n  requires: user.status = active\n  ensures: Done()\n}\n`,
@@ -764,6 +1018,75 @@ test("does not report deferred specification with location hint", () => {
   );
 });
 
+test("does not report deferred specification with see-comment location hint", () => {
+  const findings = analyzeAllium(
+    `deferred EscalationPolicy.at_level    -- see: detailed/escalation.allium\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+    false,
+  );
+});
+
+test("reports deferred specification with a URL glued to the path", () => {
+  // No space before the URL: the marker is part of the (unspaced) path, not a hint.
+  const findings = analyzeAllium(`deferred Foohttps://x\n`);
+  assert.ok(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+  );
+});
+
+test("reports deferred specification with a non-hint trailing comment", () => {
+  const findings = analyzeAllium(
+    `deferred EscalationPolicy.at_level    -- TODO write this\n`,
+  );
+  assert.ok(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+  );
+});
+
+test("does not report expression-shaped deferred path with a quote", () => {
+  // Parity with the Rust analyzer: the quote falls in the suffix after the flat
+  // name capture, so both sides treat it as a (malformed) location hint.
+  for (const line of [`deferred Foo("x")\n`, `deferred Foo = "x"\n`]) {
+    const findings = analyzeAllium(line);
+    assert.equal(
+      findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+      false,
+    );
+  }
+});
+
+test("treats a lone carriage return as a line boundary", () => {
+  // `m`-flag anchors split at a bare `\r` — locked here for Rust parity, whose
+  // replayed match uses the same terminator set.
+  const findings = analyzeAllium(`deferred Foo\rdeferred Bar\n`);
+  const hints = findings.filter(
+    (f) => f.code === "allium.deferred.missingLocationHint",
+  );
+  assert.equal(hints.length, 2);
+});
+
+test("does not report parenthesised deferred path", () => {
+  // The name pattern requires `deferred` + whitespace + `[A-Za-z_]`, so a
+  // parenthesised path never matches — locked here for Rust parity.
+  const findings = analyzeAllium(`deferred (Foo)\n`);
+  assert.equal(
+    findings.some((f) => f.code === "allium.deferred.missingLocationHint"),
+    false,
+  );
+});
+
+test("reports qualified deferred path under its flat name", () => {
+  // The name capture stops at `/`; both analyzers warn and name `billing`.
+  const findings = analyzeAllium(`deferred billing/InvoiceWorkflow\n`);
+  const hint = findings.find(
+    (f) => f.code === "allium.deferred.missingLocationHint",
+  );
+  assert.ok(hint);
+  assert.ok(hint.message.includes("'billing'"));
+});
+
 test("reports undefined status assignment value", () => {
   const findings = analyzeAllium(
     `entity Invitation {\n  status: pending | active | completed\n}\n\nrule CloseInvitation {\n  when: invitation: Invitation.created_at <= now\n  ensures: invitation.status = archived\n}\n`,
@@ -818,7 +1141,10 @@ test("accepts transitions_to trigger shape", () => {
   const findings = analyzeAllium(
     `entity Order {\n  status: String\n}\n\nrule NotifyOnChange {\n  when: order: Order.status transitions_to shipped\n  ensures: Done()\n}\n`,
   );
-  assert.equal(findings.filter((f) => f.code === "allium.rule.unknownTrigger").length, 0);
+  assert.equal(
+    findings.filter((f) => f.code === "allium.rule.unknownTrigger").length,
+    0,
+  );
 });
 
 // Fix 1: related: clause parsing extracts only the surface name
@@ -866,6 +1192,53 @@ test("does not report unused binding for discard binding _", () => {
 test("does not report unreachable status when assigned from variable", () => {
   const findings = analyzeAllium(
     `entity Quote {\n  status: pending | quoted | filled\n}\n\nrule ApplyStatusUpdate {\n  when: update: Quote.status becomes pending\n  ensures: update.status = new_status\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.status.unreachableValue"),
+    false,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.status.noExit"),
+    false,
+  );
+});
+
+// Issue #18: surface parameter types disambiguate shared status values
+test("surface param types disambiguate shared status values across entities", () => {
+  const findings = analyzeAllium(
+    `entity Account {\n  status: active | suspended\n}\n\n` +
+      `entity Subscription {\n  status: active | expired | cancelled\n}\n\n` +
+      `surface AccountAdmin {\n  facing admin: Admin\n  provides:\n` +
+      `    SuspendAccount(admin, account: Account)\n      when account.status = active\n` +
+      `    ReinstateAccount(admin, account: Account)\n      when account.status = suspended\n}\n\n` +
+      `surface SubscriptionAdmin {\n  facing admin: Admin\n  provides:\n` +
+      `    CancelSubscription(admin, sub: Subscription)\n      when sub.status = active\n` +
+      `    RenewSubscription(admin, sub: Subscription)\n      when sub.status != active\n` +
+      `    ExpireSubscription(admin, sub: Subscription)\n      when sub.status = active\n}\n\n` +
+      `rule AccountSuspended {\n  when: SuspendAccount(admin, account)\n  requires: account.status = active\n  ensures: account.status = suspended\n}\n\n` +
+      `rule AccountReinstated {\n  when: ReinstateAccount(admin, account)\n  requires: account.status = suspended\n  ensures: account.status = active\n}\n\n` +
+      `rule SubscriptionCancelled {\n  when: CancelSubscription(admin, sub)\n  requires: sub.status = active\n  ensures: sub.status = cancelled\n}\n\n` +
+      `rule SubscriptionExpired {\n  when: ExpireSubscription(admin, sub)\n  requires: sub.status = active\n  ensures: sub.status = expired\n}\n\n` +
+      `rule SubscriptionRenewed {\n  when: RenewSubscription(admin, sub)\n  requires: sub.status != active\n  ensures: sub.status = active\n}\n`,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.status.unreachableValue"),
+    false,
+  );
+  assert.equal(
+    findings.some((f) => f.code === "allium.status.noExit"),
+    false,
+  );
+});
+
+// Issue #18: negated requires counts as an exit for the complement values
+test("negated requires counts as exit for complement status values", () => {
+  const findings = analyzeAllium(
+    `entity Order {\n  status: draft | submitted | approved | rejected\n}\n\n` +
+      `rule OrderSubmitted {\n  when: SubmitOrder(clerk, order)\n  requires: order.status = draft\n  ensures: order.status = submitted\n}\n\n` +
+      `rule OrderApproved {\n  when: ApproveOrder(clerk, order)\n  requires: order.status = submitted\n  ensures: order.status = approved\n}\n\n` +
+      `rule OrderRejected {\n  when: RejectOrder(clerk, order)\n  requires: order.status = submitted\n  ensures: order.status = rejected\n}\n\n` +
+      `rule OrderReactivated {\n  when: ReactivateOrder(clerk, order)\n  requires: order.status != draft\n  ensures: order.status = draft\n}\n`,
   );
   assert.equal(
     findings.some((f) => f.code === "allium.status.unreachableValue"),

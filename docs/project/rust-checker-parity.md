@@ -72,10 +72,125 @@ Added a targeted check for rules with bare entity bindings (e.g. `when: state: C
 
 Removed early return when no config block exists (the TS checks for `config.xxx` references regardless). Added `Expr::For`, `Expr::LetExpr`, and `Expr::Lambda` handling to `check_config_refs_in_expr`. Changed severity from error to warning to match TS.
 
+### 6. `deferred.missingLocationHint` predicate unified
+
+The Rust `check_deferred_location_hints` previously emitted the warning for every `deferred` declaration unconditionally — it inspected only the parsed path expression, which drops the trailing comment, so it could never see a hint. It now replays the TypeScript analyzer's line match (`^\s*deferred\s+([A-Za-z_][A-Za-z0-9_.]*)(.*)$`) over the raw source anchored at the declaration's `deferred` keyword, and applies the same predicate as `findDeferredLocationHints` to the suffix between the captured name and the end of its line.
+
+A deferred declaration is treated as carrying a location hint when that suffix includes a quoted path, a URL (`http://`/`https://`), or the `-- see:` comment convention shown in the language reference. The TypeScript predicate was broadened from quoted-path/URL-only to also recognise `-- see:`, so the documented `deferred X -- see: path.allium` form is now accepted by both implementations.
+
+Replaying the match — rather than trusting the parsed path's span — is what keeps the two in step: the Rust parser reads the path as a full expression, which can extend past the flat name (qualified `billing/InvoiceWorkflow` paths, expression-shaped paths like `Foo("x")`) or start after it (`deferred (Foo)`), moving the suffix boundary or fabricating a name the TypeScript pattern would never capture — either flips the verdict. With the replayed match, both sides also name the warning after the same flat name. Scanning the suffix rather than the whole line matters for the URL markers: a URL glued to the identifier (`deferred Foohttps://x`) is an unspaced path with no hint, and warns in both. See issue #20 and the review on PR #23.
+
+Scope of the guarantee: parity covers every line that parses into a `DeferredDecl`. The replayed match treats `\n`, `\r`, U+2028 and U+2029 as line terminators — the JavaScript `m`-flag set — so CRLF and lone-CR files behave identically on both sides. The remaining divergences are inputs the two front ends read differently before this check runs: a malformed deferred line that fails the Rust expression parser (`deferred Foo.`, `deferred Foo == "x"`) surfaces a parse error instead of this warning, and the TypeScript pattern — which runs over raw text with no comment or string awareness, and never consumes parse diagnostics — can fire on `deferred`-shaped text the Rust lexer reads as comment or string content (e.g. after a lone `\r` inside a `--` comment). Diagnostic-set parity on such inputs is out of scope for this check.
+
+### 7. Parse diagnostics surfaced (issue #25)
+
+The TypeScript front end discarded the WASM parser's `result.diagnostics`:
+`wasmBlocksToParsedBlocks` read only `result.module.declarations`, so malformed
+input produced zero parse errors in the extension, the LSP server, and
+`check.js`, while `allium check` reported them (e.g. `deferred Foo.` is a parse
+error in Rust but was silent in TypeScript).
+
+The parse result now flows through a new `parseAlliumDocument` (in
+`extensions/allium/src/language-tools/parser.ts`), and `analyzeAllium` maps each
+parse diagnostic into a finding (`allium.parse.error` / `allium.parse.warning`),
+matching how `allium check` chains `result.diagnostics` ahead of the analysis
+diagnostics. Because all three consumers (`check.js`, the LSP server, and — via
+the language client — the VS Code extension) run through `analyzeAllium`, the
+fix reaches every surface. Well-formed specs are unaffected: the parser only
+emits diagnostics for genuine syntax errors and for files missing the
+`-- allium: N` version marker (both of which the Rust CLI also reports).
+
+This closes the "Rust errors, TypeScript silent" direction of the malformed-input
+divergence described above. The complementary direction — the regex lanes warning
+on `deferred`-shaped text that the Rust front end reads as comment/string content
+— is addressed by #28 (see below).
+
+While surfacing parse errors, a latent bug in the temporal-guard autofix was
+exposed and fixed: the scaffold emitted `requires: /* add temporal guard */`
+(a C-style comment, invalid in Allium) and the `check.js`/`fix-all.ts` paths
+inserted it *before* the `when:` clause (invalid clause ordering). It now emits
+`requires: TODO() -- add temporal guard` after the `when:` line. Previously these
+produced parse errors that nothing surfaced.
+
+### 8. Regex lanes made comment/string aware (issue #28)
+
+The TypeScript lanes in `analyzer.ts` run regexes over raw source text with no
+lexer context, so they matched keyword-shaped text inside comments and string
+literals that the Rust front end reads as content, not code — e.g. a
+`deferred`-shaped token inside a `--` comment produced a spurious
+`allium.deferred.missingLocationHint` that `allium check` never emits. This is
+the "Rust silent, TypeScript false-positive" direction left open by #25.
+
+`analyzeAllium` now computes a **masked view** of the source via
+`maskCommentsAndStrings`, which blanks comment and string/backtick *content* to
+spaces while preserving length, offsets, and line breaks. The masker mirrors the
+Rust lexer: line comments run from `--` to the next `\n` (a lone `\r` does not
+end them), strings honour `\` escapes and terminate at `"`/`\n`, and backtick
+literals terminate at `` ` ``/`\n`/`\r`. Block bodies are re-sliced from the
+masked text, so every body-based lane inherits the awareness, and the detection
+lanes receive the masked text in place of raw text.
+
+Two consumers deliberately keep the **raw** text because they read comment/string
+content on purpose: `findDeferredLocationHints` (the `-- see:` / quoted-path /
+URL hint — it now detects the `deferred` keyword on the masked text but reads the
+hint suffix from raw text) and `applySuppressions` (the `-- allium-ignore`
+directive). Delimiters (`"`, `` ` ``) and the `--` of a comment are preserved by
+the mask, so lanes that only need to detect that a string or comment is present
+(e.g. the type-mismatch operand lanes) still see one.
+
+The status-lifecycle checker (`allium.status.unreachableValue` /
+`allium.status.noExit`) was refined in both implementations for issue #18:
+
+- Rule `when:` bindings take their entity type from the surface `provides:`
+  declaration of the command they subscribe to, matched positionally
+  (`Cancel(admin, sub: Subscription)` types `sub` as `Subscription`). Without
+  this, a status value shared by several entities (e.g. two entities both
+  declaring `active`) made the binding unresolvable and silently dropped the
+  rule's assignments and transitions. Rust:
+  `collect_command_param_types`/`augment_binding_types_from_commands`;
+  TypeScript: `collectCommandParamTypes`/`augmentBindingTypesFromCommands`.
+- A negated `requires: x.status != v` is expanded to the complement of the
+  entity's status enum, so every other value gains an exit edge through that
+  rule. Previously only `=` comparisons produced exit edges.
+
+One refinement landed as a follow-up regression fix: lanes that compare
+string-literal **values** textually (`findNeverFireRuleIssues`,
+`findSurfaceImpossibleWhenIssues`) cannot compare masked literals, because
+masking collapses distinct same-length literals to identical spaces (`"a"` and
+`"b"` both become `" "`) — producing a spurious `rule.neverFires` on satisfiable
+requires pairs and missing genuine contradictions. These lanes still *match* on
+masked text but re-read string operands from the raw source via
+`rawStringOperand`, exploiting the mask's length/offset preservation.
+
+The unreachable-trigger checker (`allium.rule.unreachableTrigger` /
+`allium.rule.invalidTrigger`) was refined in both implementations for
+issue #19:
+
+- A qualified trigger call (`when: alias/Trigger(...)`) is a valid trigger
+  form — the language reference's "Responding to external triggers" section
+  documents it. Rust previously rejected it with `rule.invalidTrigger`;
+  TypeScript already accepted it.
+- Qualified subscriptions are resolved cross-module where possible. The Rust
+  CLI builds a per-file alias → provided/emitted-trigger map
+  (`collect_trigger_outputs` + `CrossModuleContext.imported_triggers`) and
+  flags `alias/Trigger` only when the aliased module is in the check set and
+  determinately lacks the trigger; aliases pointing outside the check set are
+  never flagged. Unqualified triggers emitted by an imported module also count
+  as reachable. The single-file TypeScript analyzer cannot see other modules,
+  so it skips qualified subscriptions entirely (a call name preceded by `/`).
+- A trigger emitted as the leading call of an `if`/`else if`/`else` branch or
+  a `for` iteration inside an `ensures:` value counts as an emission. Rust:
+  `collect_leading_ensures_call` recurses into `Conditional` and `For`;
+  TypeScript: a branch-call lane scoped to ensures clause extents
+  (`ensuresClauseRegions`). Both still collect only the leading call of each
+  branch body, consistent with the leading-call-only convention above.
+
 ## Diagnostic codes implemented
 
 | Code | Severity | Rust | TypeScript |
 |---|---|---|---|
+| `allium.parse.error` | error | Yes (no code) | Yes |
+| `allium.parse.warning` | warning | Yes (no code) | Yes |
 | `allium.surface.relatedUndefined` | error | Yes | Yes |
 | `allium.sum.v1InlineEnum` | error | Yes | Yes |
 | `allium.sum.discriminatorUnknownVariant` | error | Yes | Yes |
@@ -97,6 +212,8 @@ Removed early return when no config block exists (the TS checks for `config.xxx`
 | `allium.config.undefinedReference` | warning | Yes | Yes |
 | `allium.surface.unusedPath` | info | Disabled | Yes |
 
+`allium.surface.requiresWithoutDeferred` is TypeScript-only (no Rust equivalent yet). When porting it, note the deferred-name matching semantics fixed in issue #26: a named requires block matches a deferred declaration by its full name, by a trailing `.`-separated segment, or — for module-qualified declarations like `deferred billing/InvoiceWorkflow` — by the unqualified name after the `alias/` prefix. The alias alone must not satisfy the match.
+
 ## Suppression system
 
 Both implementations support `-- allium-ignore code1, code2` comments. The directive suppresses diagnostics on the same line or the next line. The Rust implementation uses `regex-lite` for parsing; the suppression regex must not span blank lines (use `[^\S\n]*` not `\s*` at the start).
@@ -105,7 +222,7 @@ Both implementations support `-- allium-ignore code1, code2` comments. The direc
 
 ```bash
 cargo build --release          # Build Rust CLI
-cargo test                     # Run Rust tests (304 in parser, 140 in CLI)
+cargo test                     # Run Rust tests
 npm run build                  # Build TypeScript
 npm run test                   # Run TypeScript tests
 ```
